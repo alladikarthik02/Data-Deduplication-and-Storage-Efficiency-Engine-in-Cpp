@@ -99,6 +99,22 @@ class Store;
 // removes the obvious global bottleneck (SPEC 3.5). The cost is space
 // fragmentation across partially-filled containers, which GC's copy-forward
 // compaction later reclaims (SPEC 8.2).
+// A container that is currently open for appending, shared between the session
+// that owns it and any OTHER session that needs to make its contents durable.
+//
+// This exists because of a cross-thread durability hole (CHALLENGES B11): thread
+// B can dedup against a chunk thread A appended but never synced, then publish a
+// recipe referencing it. Syncing only your own container makes S4 hold within a
+// thread and fail across threads. A recipe publish must therefore be able to
+// reach into whichever containers it referenced.
+struct ContainerSlot {
+  std::mutex mu;                     // guards writer_ (append, flush, sync, close)
+  ContainerWriter writer;
+  std::atomic<uint64_t> durable{0};  // bytes known to be fsynced
+  std::atomic<uint64_t> visible{0};  // bytes handed to the kernel (readable)
+  std::atomic<bool> open{true};
+};
+
 class IngestSession {
  public:
   ~IngestSession();
@@ -119,11 +135,13 @@ class IngestSession {
   IngestSession() = default;
 
   Result<Location> write_chunk(const Digest32& fp, ByteSpan payload);
-  Status sync_container();
+  // Make every container this ingest referenced durable -- ours AND anyone
+  // else's that we deduped against.
+  Status make_referenced_durable(const std::map<uint32_t, uint64_t>& referenced);
+  void note_reference(std::map<uint32_t, uint64_t>* referenced, const Location& loc);
 
   Store* store_ = nullptr;
-  ContainerWriter writer_;
-  bool has_writer_ = false;
+  std::shared_ptr<ContainerSlot> slot_;
   uint64_t bytes_since_sync_ = 0;
 };
 
@@ -161,6 +179,12 @@ class Store {
   Index& index() { return index_; }
   const std::array<uint8_t, 16>& uuid() const { return uuid_; }
 
+  // How many times a recipe publish had to fsync a container it did not own,
+  // because it deduped against a chunk another session had written but not yet
+  // made durable. Observable so the cross-thread S4 fix can be tested rather
+  // than asserted (CHALLENGES B11); also a genuine contention signal.
+  uint64_t forced_syncs() const { return forced_syncs_.load(std::memory_order_relaxed); }
+
   // Reads one chunk by fingerprint, through the index. Verifies CRC always and
   // the full fingerprint when options().verify_fingerprint_on_read is set.
   Result<std::vector<uint8_t>> read_chunk(const Digest32& fp);
@@ -178,7 +202,13 @@ class Store {
   Status read_superblock();
   Status rebuild_index();
 
-  Result<ContainerWriter> new_container();
+  Result<std::shared_ptr<ContainerSlot>> new_container();
+  // Ensure a container's bytes up to `end` are readable (flushed) or durable
+  // (flushed + fsynced). A container with no open slot was closed or predates
+  // this process, so whatever is on disk is already both.
+  Status ensure_visible(uint32_t container_id, uint64_t end);
+  Status ensure_durable(uint32_t container_id, uint64_t end);
+  std::shared_ptr<ContainerSlot> find_slot(uint32_t container_id);
   Result<std::shared_ptr<ContainerReader>> reader_for(uint32_t container_id);
 
   std::string path_;
@@ -193,7 +223,11 @@ class Store {
   std::shared_mutex readers_mu_;
   std::map<uint32_t, std::shared_ptr<ContainerReader>> readers_;
 
+  std::shared_mutex slots_mu_;
+  std::map<uint32_t, std::shared_ptr<ContainerSlot>> slots_;
+
   std::atomic<uint64_t> physical_bytes_{0};
+  std::atomic<uint64_t> forced_syncs_{0};
 };
 
 }  // namespace dedupe

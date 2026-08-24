@@ -169,3 +169,61 @@ That is the number résumé bullet R3.2 is about, and it holds because a chunk c
 to fingerprint and ~0.1 µs to look up — the index is under 2% of the work. Reporting the
 index latency alone would have overstated the problem; reporting only the throughput would
 have hidden it. Both are here.
+
+---
+
+## T6 — concurrent ingest
+
+```bash
+./scripts/dev.sh ./build-none/bench_ingest
+```
+
+4 files × 8 MiB of **unique** data per thread (deduplicating input would exercise the
+fast path and prove nothing about the write path). `fsyncs` and `writes` are counted by
+reusing the fault injector's per-syscall counters as free instrumentation.
+
+| threads | MiB | seconds | MB/s | speedup | fsyncs | writes |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 32.0 | 0.116 | 275.0 | 1.00× | 13 | 41 |
+| 2 | 64.0 | 0.128 | 499.9 | **1.82×** | 26 | 82 |
+| 4 | 128.0 | 0.177 | 722.2 | **2.63×** | 52 | 164 |
+| 8 | 256.0 | 0.287 | 893.5 | **3.25×** | 104 | 328 |
+
+3.25× on 8 cores. The scaling is real but sub-linear, and the instrumentation says why.
+
+### Where the time actually goes
+
+Measured directly in the same container:
+
+```
+write(1 MiB) + fsync :  2.10 ms each   (482 MB/s)
+write(1 MiB) alone   :  0.16 ms each  (6359 MB/s)
+```
+
+So an `fsync` costs **~1.94 ms** and a 1 MiB write costs **0.16 ms**. For the
+single-threaded 32 MiB run:
+
+| component | cost | share of 116 ms |
+|---|---:|---:|
+| CPU: chunk + SHA-256 (at the T2 measured 966 MB/s) | ~33 ms | 28% |
+| 13 × fsync | ~25 ms | 22% |
+| 32 MiB of writes | ~5 ms | **4%** |
+| index, recipe encoding, allocation, scheduling | remainder | ~46% |
+
+**Ingest is fsync-bound, not syscall-bound — and that is the price of S4.** Every recipe
+publish must make its chunks durable first, so the fsyncs are not overhead to be
+optimized away; they are the guarantee.
+
+### An optimization that did not pay, reported anyway
+
+Batching container appends into a 1 MiB write buffer cut write syscalls by **88×**
+(≈3610 one-per-chunk writes for 32 MiB → 41). Throughput went from 275.0 MB/s to
+275.0 MB/s — no measurable change, because writes were only 4% of the time to begin with.
+
+The change is kept for two reasons that are not throughput: it separates *visible*
+(flushed, readable by another thread) from *durable* (fsynced), which the cross-thread
+durability fix needs; and syscall pressure matters more on filesystems slower than this
+one. But the number is reported as it came out. This is the second time in this project
+that a plausible optimization delivered nothing (see `CHALLENGES.md` B6) — the lesson
+each time was the same one, arrived at from a different direction: measure which
+component is actually the bottleneck before optimizing any of them.

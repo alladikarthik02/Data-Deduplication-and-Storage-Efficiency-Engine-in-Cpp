@@ -583,3 +583,107 @@ the aggregate load, never checked it, and built a memory claim on top. The assum
 load-bearing and invisible until something forced a measurement. The measurement is now a
 test (`CHECK_GE(load_factor, 0.55)`), so a future change that reintroduces doubling fails
 in CI instead of quietly costing 40% more RAM.
+
+---
+
+## B11 ⚔️ Durability held within a thread and broke across threads
+
+**Symptom.** None — no test failed. This was found by reading the publish path while
+writing T6's concurrency suite, and asking what happens when two sessions interact.
+
+```
+Thread A appends chunk X to container 3.  Not fsynced yet: page cache only.
+Thread B ingests content containing X, gets a dedup HIT, and publishes its recipe
+        after syncing ITS OWN container (7).  Container 3 is never synced.
+Crash.  B's recipe references a chunk that is not durable.
+```
+
+`IngestSession::sync_container()` synced the session's own writer and nothing else. That
+makes S4 ("never publish a reference before its data is durable") true within a thread
+and false across threads. **T5 could not have caught it**: with one session you always
+own every container you reference, so the hole does not exist until a second thread does.
+
+**Why it is worth the fix even though the window is small.** The whole point of a
+recipe is that it is the moment a file starts existing. A crash in that window produces a
+file that lists chunks nobody can read — and unlike a lost ingest, it looks like success
+to whoever ran it. Losing an ingest is an inconvenience; a file that exists and cannot be
+restored is a corrupted backup.
+
+**Fix.** Containers currently open for appending are held in a `ContainerSlot` that any
+session can reach: a per-container mutex, the writer, and two atomic watermarks —
+`visible` (flushed to the kernel, so another thread can read it) and `durable` (fsynced).
+Ingest records every container it touched, **dedup hits included**, and the publish path
+calls `ensure_durable(container, end)` on each one before writing the recipe. A container
+with no open slot was closed (which syncs) or predates this process, so it is already
+durable and costs nothing.
+
+**Making it testable.** A found-by-inspection bug needs an observable signature, or the
+fix is just a claim. `Store::forced_syncs()` counts publishes that had to fsync a
+container, and the test asserts both directions:
+
+- when A's container is **already** durable, B forces **0** syncs — no redundant fsync on
+  every publish, which would have been a quiet performance regression;
+- when it is **not** (created deterministically by injecting a failure into A's own sync,
+  which leaves exactly the state the race produces: chunks indexed, container not
+  durable), B — having written **zero** bytes of its own — forces **1**.
+
+**Generalizes to.** Invariants that quantify over "my own state" are the ones that break
+when a second thread appears; the question to ask of any durability rule is *whose* data
+it covers. And a bug found by reading needs a test with an observable signature before you
+can claim it is fixed — otherwise the fix and the belief in the fix are the same object.
+
+---
+
+## B12 🐛 The write buffer could duplicate bytes it had already written
+
+**Symptom.** After adding a 1 MiB write buffer to `ContainerWriter`, an existing test —
+`container_survives_injected_write_failure`, written back in T3 for a different purpose —
+started failing:
+
+```
+CHECK(!bad.ok())                                    <- append() no longer reports the error
+CHECK_EQ(rec.value().records.size(), 4)  got: 5     <- and the torn record was complete
+```
+
+Two separate problems behind one failure, which is why it took a moment to untangle.
+
+**Problem 1: the error moved.** Appends are buffered, so a write failure no longer
+surfaces at `append()` — it surfaces at `flush()`/`sync()`/`close()`. The old assertion was
+testing the pre-buffering contract. Safe in itself (a recipe is published only after a
+successful sync), but it is a real change to the interface and it is now documented at
+the declaration rather than left for the next person to discover.
+
+**Problem 2: the actual bug.** `flush()` was:
+
+```c++
+RETURN_IF_ERROR(file_.write_all(buf_));   // partial write -> returns error
+flushed_ += buf_.size();                  // never runs
+buf_.clear();                             // never runs
+```
+
+On a **partial** write, `write_all` has already put a prefix of the buffer into the file,
+then failed. The buffer is left holding all of it. The next flush appends the whole buffer
+again — so the file gets that prefix **twice**, and the duplicate lands in the middle of a
+record. `scan()` would detect the damage and truncate, which means every later record in
+that container is thrown away: an I/O hiccup turned into data loss well beyond the write
+that failed.
+
+**Fix.** `File::write_all` now reports how many bytes actually reached the file, on every
+exit path including the error path (via a small RAII reporter so no `return` can skip it).
+`flush()` drops exactly that prefix and keeps the rest, so a retry resumes instead of
+restarting.
+
+**Problem 3, found while fixing the test: my test repaired the tear it was creating.**
+With `fail_nth(kWrite, 2)` the failure fires exactly once. `sync()` failed as intended — and
+then `close()` flushed again, hit no armed fault, and **completed the record**. The test was
+asserting on a torn tail it had just healed. Injecting a single transient error models a
+hiccup, not a device that has gone away, and recovery tests usually want the latter. Added
+`faults::fail_from(op, n)` — fail the nth call and every one after it — which is what T8's
+crash tests will want too.
+
+**Generalizes to.** An optimization that changes *when* an error is reported has changed
+the interface, not just the implementation. And retry loops are where partial-progress
+bugs live: any wrapper that can fail halfway must report how far it got, or its caller
+cannot distinguish "nothing happened" from "half of it happened" — and those need opposite
+recovery. That the bug was caught at all is down to a fault-injection test written three
+tasks earlier for an unrelated reason.

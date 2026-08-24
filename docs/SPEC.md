@@ -69,7 +69,7 @@
 | R2.1 | GC runs on a **background thread**, triggered by policy or by `dedupe gc`. | `src/gc.cpp` + `test_gc`. |
 | R2.2 | GC **frees** space: after deleting files, physical bytes on disk actually shrink. | `test_gc`: assert container bytes drop by the expected amount. |
 | R2.3 | GC is **safe**: it never frees a chunk that any surviving recipe references. See **S2**. | `test_gc_stress`: concurrent ingest + delete + GC, then restore *every* surviving file and byte-compare. |
-| R2.4 | GC runs **concurrently** with reads and writes. | `test_gc_stress` runs ingest and restore threads for the entire GC cycle with no external barrier. |
+| R2.4 | GC runs **concurrently** with reads and writes. | `test_gc_stress` runs ingest and restore threads for the entire GC cycle with no external barrier. T6 laid the foundation: 4-thread ingest, concurrent restore-during-ingest, and concurrent `list`/`stats` during churn, all TSan-clean. |
 | R2.5 | GC does not **block** foreground operations. | `bench/gc_latency`: measure foreground p50/p99/p99.9 ingest latency with GC idle vs GC running; assert p99 inflation stays under a stated bound, and report the real number. |
 
 > **R3.** "Tuned the chunking and indexing path with a memory-efficient fingerprint index, holding
@@ -324,6 +324,21 @@ chunk size of 9294 B that is **0.554% of logical data**, so 1 TiB of unique data
   decision that removes the obvious global bottleneck — a single shared append lock would serialize
   every writer. Per-thread containers cost some space fragmentation, which GC's copy-forward
   compaction (§3.6) later cleans up. Both halves of that trade are deliberate.
+  Measured (`BENCHMARKS.md` T6): **275 → 893 MB/s, 3.25× on 8 cores.** Sub-linear because ingest is
+  **fsync-bound** (~1.94 ms per fsync here) rather than CPU- or syscall-bound, and the fsyncs are
+  the S4 guarantee rather than overhead.
+- **Cross-thread durability.** An open container is held in a `ContainerSlot` — a per-container
+  mutex plus two atomic watermarks, `visible` (flushed, readable by other threads) and `durable`
+  (fsynced). A recipe publish calls `ensure_durable()` on **every container it referenced, dedup
+  hits included**, not merely its own. Syncing only your own container makes S4 true within a
+  thread and false across threads, which is a corrupted-backup bug rather than a lost-ingest one
+  (`CHALLENGES.md` B11). `Store::forced_syncs()` makes it observable, and the test asserts both
+  that a non-durable container *is* synced and that an already-durable one is *not*.
+- **Buffered appends.** Container appends batch into 1 MiB writes, so an I/O error surfaces at
+  `flush()`/`sync()`/`close()` rather than at `append()`. Safe — a recipe is only published after a
+  successful sync — but it is an interface change, and it introduced a partial-write duplication
+  bug that `write_all` now prevents by reporting bytes written on the error path
+  (`CHALLENGES.md` B12).
 - **Index:** 256 shard locks, `shared_mutex` — readers (dedup probes, restore lookups) share, writers
   take exclusive briefly.
 - **Lock order (single global rule):** `shard lock` → `container writer lock`. Never the reverse. GC

@@ -20,6 +20,7 @@ constexpr size_t kOpCount = static_cast<size_t>(Op::kMax);
 struct State {
   std::array<std::atomic<uint64_t>, kOpCount> counts{};
   std::array<std::atomic<uint64_t>, kOpCount> fail_at{};   // 0 = disarmed
+  std::array<std::atomic<uint64_t>, kOpCount> fail_from{}; // 0 = disarmed
   std::array<std::atomic<uint64_t>, kOpCount> short_at{};  // 0 = disarmed
   std::array<std::atomic<int>, kOpCount> fail_code{};
 };
@@ -53,6 +54,12 @@ void fail_nth(Op op, uint64_t nth, Err code) {
   state().fail_code[i].store(static_cast<int>(code), std::memory_order_relaxed);
 }
 
+void fail_from(Op op, uint64_t nth, Err code) {
+  const size_t i = static_cast<size_t>(op);
+  state().fail_from[i].store(nth, std::memory_order_relaxed);
+  state().fail_code[i].store(static_cast<int>(code), std::memory_order_relaxed);
+}
+
 void short_nth(Op op, uint64_t nth) {
   state().short_at[static_cast<size_t>(op)].store(nth, std::memory_order_relaxed);
 }
@@ -61,6 +68,7 @@ void reset() {
   for (size_t i = 0; i < kOpCount; i++) {
     state().counts[i].store(0, std::memory_order_relaxed);
     state().fail_at[i].store(0, std::memory_order_relaxed);
+    state().fail_from[i].store(0, std::memory_order_relaxed);
     state().short_at[i].store(0, std::memory_order_relaxed);
     state().fail_code[i].store(0, std::memory_order_relaxed);
   }
@@ -78,8 +86,9 @@ namespace {
 Status tick(Op op) {
   const size_t i = static_cast<size_t>(op);
   const uint64_t n = state().counts[i].fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint64_t from = state().fail_from[i].load(std::memory_order_relaxed);
   const uint64_t at = state().fail_at[i].load(std::memory_order_relaxed);
-  if (at != 0 && n == at) {
+  if ((at != 0 && n == at) || (from != 0 && n >= from)) {
     const Err code = static_cast<Err>(state().fail_code[i].load(std::memory_order_relaxed));
     return Status::error(code, std::string("injected fault on ") + op_name(op) + " #" +
                                    std::to_string(n));
@@ -130,8 +139,15 @@ Result<File> File::open(const std::string& path, int flags, mode_t mode) {
   return f;
 }
 
-Status File::write_all(ByteSpan data) {
+Status File::write_all(ByteSpan data, size_t* out_done) {
   size_t done = 0;
+  // Report progress on EVERY exit path, error included.
+  struct Reporter {
+    size_t* out;
+    const size_t* done;
+    ~Reporter() { if (out != nullptr) *out = *done; }
+  } reporter{out_done, &done};
+
   while (done < data.size()) {
     RETURN_IF_ERROR(faults::tick(faults::Op::kWrite));
     size_t want = data.size() - done;
@@ -323,7 +339,14 @@ Result<std::vector<std::string>> list_dir(const std::string& path) {
 }
 
 Status write_file_atomic(const std::string& path, ByteSpan data) {
-  const std::string tmp = path + ".tmp";
+  // The temp name must be unique per writer. A fixed "<path>.tmp" looks fine
+  // single-threaded and is a data-corruption race the moment two threads publish
+  // the same name: both open the same temp file, their writes interleave, and
+  // both rename the result into place. Found by inspection before T6's stress
+  // test could hit it (CHALLENGES B11).
+  static std::atomic<uint64_t> seq{0};
+  const std::string tmp = path + ".tmp." + std::to_string(::getpid()) + "." +
+                          std::to_string(seq.fetch_add(1, std::memory_order_relaxed));
   const size_t slash = path.rfind('/');
   const std::string dir = (slash == std::string::npos) ? std::string(".") : path.substr(0, slash);
 
@@ -336,6 +359,9 @@ Status write_file_atomic(const std::string& path, ByteSpan data) {
     RETURN_IF_ERROR(f.sync());
     RETURN_IF_ERROR(f.close());
   }
+  // rename() is atomic even when the destination exists, so a concurrent
+  // publisher of the same name loses cleanly: one whole file wins, and no reader
+  // ever observes a mixture.
   RETURN_IF_ERROR(rename_file(tmp, path));
   // And the rename itself is only durable once the directory is synced.
   RETURN_IF_ERROR(fsync_dir(dir));

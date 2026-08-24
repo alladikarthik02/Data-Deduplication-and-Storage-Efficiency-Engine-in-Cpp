@@ -75,6 +75,9 @@ dedupe_test(test_index)
 # --- T5: the store ------------------------------------------------------------
 dedupe_test(test_store)
 
+# --- T6: concurrency ----------------------------------------------------------
+dedupe_test(test_concurrent)
+
 # The CLI.
 add_executable(dedupe tools/dedupe_cli.cpp)
 target_link_libraries(dedupe PRIVATE dedupe_core)
@@ -87,3 +90,5 @@ add_executable(bench_chunker bench/bench_chunker.cpp)
 target_link_libraries(bench_chunker PRIVATE dedupe_core)
 add_executable(bench_index bench/bench_index.cpp)
 target_link_libraries(bench_index PRIVATE dedupe_core)
+add_executable(bench_ingest bench/bench_ingest.cpp)
+target_link_libraries(bench_ingest PRIVATE dedupe_core)

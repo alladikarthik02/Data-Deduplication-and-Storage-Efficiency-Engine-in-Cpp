@@ -47,6 +47,13 @@ inline bool corrupt_byte(const std::string& path, uint64_t offset, uint8_t xor_m
   return rc != EOF;
 }
 
+// Always disarm the fault injector, even if a CHECK bails out of a test early.
+// A leaked armed fault would fail an unrelated later suite and look like a real
+// bug in that suite.
+struct FaultGuard {
+  ~FaultGuard() { dedupe::faults::reset(); }
+};
+
 inline bool truncate_file(const std::string& path, uint64_t length) {
   std::error_code ec;
   std::filesystem::resize_file(path, length, ec);

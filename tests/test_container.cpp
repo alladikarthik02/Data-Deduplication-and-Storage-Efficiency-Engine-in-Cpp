@@ -329,19 +329,37 @@ TEST(container_survives_injected_write_failure) {
     auto off = w.value().append(fp, p);
     REQUIRE(off.ok());
   }
-  faults::reset();
-  faults::short_nth(faults::Op::kWrite, 1);   // partial record...
-  faults::fail_nth(faults::Op::kWrite, 2);    // ...then the retry fails
-  auto bad = w.value().append(fp, p);
-  CHECK(!bad.ok());
-  faults::reset();
-  (void)w.value().close();
+  // Make those four durable first, so the tear below is unambiguous.
+  CHECK(w.value().sync().ok());
 
-  // The four complete records are intact; the half-written fifth is a torn tail.
+  // Appends are BUFFERED, so the write failure does not surface at append() --
+  // it surfaces at the sync. Asserting on append() was testing the pre-buffering
+  // contract (CHALLENGES B12).
+  faults::reset();
+  faults::short_nth(faults::Op::kWrite, 1);  // partial record...
+  faults::fail_from(faults::Op::kWrite, 2);  // ...and the device stays broken
+  auto appended = w.value().append(fp, p);
+  CHECK(appended.ok());  // buffered, nothing has hit the kernel yet
+  const Status st = w.value().sync();
+  CHECK(!st.ok());  // THIS is where the failure must appear
+  // close() flushes too, and must also fail rather than quietly completing the
+  // record. fail_nth would have failed exactly once and let this retry succeed,
+  // which is how the first version of this test accidentally repaired the tear
+  // it was trying to create.
+  CHECK(!w.value().close().ok());
+  faults::reset();
+
+  // The four synced records are intact; the half-written fifth is a torn tail.
   auto rec = recover_container(path);
   REQUIRE(rec.ok());
   CHECK(rec.value().torn);
   CHECK_EQ(rec.value().records.size(), size_t{4});
+
+  // And recovery is idempotent: re-scanning finds a clean container.
+  auto again = recover_container(path);
+  REQUIRE(again.ok());
+  CHECK(!again.value().torn);
+  CHECK_EQ(again.value().records.size(), size_t{4});
 }
 
 RUN_ALL()

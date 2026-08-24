@@ -151,16 +151,72 @@ Result<std::unique_ptr<Store>> Store::open(const std::string& path, StoreOptions
   return store;
 }
 
-Store::~Store() = default;
+Store::~Store() {
+  // Any session that outlived its Store, or was abandoned without finish(),
+  // leaves an open slot. Flush and close them so the container files on disk are
+  // complete rather than missing their buffered tail.
+  std::unique_lock<std::shared_mutex> lk(slots_mu_);
+  for (auto& [id, slot] : slots_) {
+    std::lock_guard<std::mutex> slk(slot->mu);
+    if (!slot->open.load(std::memory_order_relaxed)) continue;
+    (void)slot->writer.sync();
+    (void)slot->writer.close();
+    slot->open.store(false, std::memory_order_relaxed);
+  }
+}
 
-Result<ContainerWriter> Store::new_container() {
-  // fetch_add so two ingest threads never pick the same id (T6).
+Result<std::shared_ptr<ContainerSlot>> Store::new_container() {
+  // fetch_add so two ingest threads never pick the same id.
   const uint32_t id = next_container_id_.fetch_add(1, std::memory_order_relaxed);
   if (id > Location::kMaxContainer) {
     return Status::error(Err::kNoSpace, "store is full: container id " + std::to_string(id) +
                                             " exceeds the 16-bit field");
   }
-  return ContainerWriter::create(container_path(id), id, uuid_);
+  ASSIGN_OR_RETURN(ContainerWriter w, ContainerWriter::create(container_path(id), id, uuid_));
+  auto slot = std::make_shared<ContainerSlot>();
+  slot->visible.store(w.flushed(), std::memory_order_relaxed);
+  slot->durable.store(0, std::memory_order_relaxed);
+  slot->writer = std::move(w);
+  {
+    std::unique_lock<std::shared_mutex> lk(slots_mu_);
+    slots_[id] = slot;
+  }
+  return slot;
+}
+
+std::shared_ptr<ContainerSlot> Store::find_slot(uint32_t id) {
+  std::shared_lock<std::shared_mutex> lk(slots_mu_);
+  auto it = slots_.find(id);
+  return (it == slots_.end()) ? nullptr : it->second;
+}
+
+Status Store::ensure_visible(uint32_t id, uint64_t end) {
+  auto slot = find_slot(id);
+  // No slot means the container was closed (which flushes) or predates this
+  // process, so everything on disk is already visible.
+  if (slot == nullptr) return Status();
+  if (slot->visible.load(std::memory_order_acquire) >= end) return Status();
+  std::lock_guard<std::mutex> lk(slot->mu);
+  if (slot->visible.load(std::memory_order_relaxed) >= end) return Status();
+  if (!slot->open.load(std::memory_order_relaxed)) return Status();
+  RETURN_IF_ERROR(slot->writer.flush());
+  slot->visible.store(slot->writer.flushed(), std::memory_order_release);
+  return Status();
+}
+
+Status Store::ensure_durable(uint32_t id, uint64_t end) {
+  auto slot = find_slot(id);
+  if (slot == nullptr) return Status();
+  if (slot->durable.load(std::memory_order_acquire) >= end) return Status();
+  std::lock_guard<std::mutex> lk(slot->mu);
+  if (slot->durable.load(std::memory_order_relaxed) >= end) return Status();
+  if (!slot->open.load(std::memory_order_relaxed)) return Status();
+  forced_syncs_.fetch_add(1, std::memory_order_relaxed);
+  RETURN_IF_ERROR(slot->writer.sync());
+  const uint64_t now = slot->writer.size();
+  slot->visible.store(now, std::memory_order_release);
+  slot->durable.store(now, std::memory_order_release);
+  return Status();
 }
 
 Result<std::shared_ptr<ContainerReader>> Store::reader_for(uint32_t id) {
@@ -182,62 +238,78 @@ Result<std::shared_ptr<ContainerReader>> Store::reader_for(uint32_t id) {
 // IngestSession
 // ---------------------------------------------------------------------------
 
-IngestSession::~IngestSession() {
-  if (has_writer_) (void)writer_.close();
-}
+IngestSession::~IngestSession() { (void)finish(); }
+
 IngestSession::IngestSession(IngestSession&& o) noexcept
-    : store_(o.store_), writer_(std::move(o.writer_)), has_writer_(o.has_writer_),
-      bytes_since_sync_(o.bytes_since_sync_) {
-  o.has_writer_ = false;
+    : store_(o.store_), slot_(std::move(o.slot_)), bytes_since_sync_(o.bytes_since_sync_) {
   o.store_ = nullptr;
 }
 IngestSession& IngestSession::operator=(IngestSession&& o) noexcept {
   if (this != &o) {
-    if (has_writer_) (void)writer_.close();
+    (void)finish();
     store_ = o.store_;
-    writer_ = std::move(o.writer_);
-    has_writer_ = o.has_writer_;
+    slot_ = std::move(o.slot_);
     bytes_since_sync_ = o.bytes_since_sync_;
-    o.has_writer_ = false;
     o.store_ = nullptr;
   }
   return *this;
 }
 
-Status IngestSession::sync_container() {
-  if (!has_writer_) return Status();
-  RETURN_IF_ERROR(writer_.sync());
-  bytes_since_sync_ = 0;
+Status IngestSession::finish() {
+  if (slot_ == nullptr) return Status();
+  auto slot = slot_;
+  slot_.reset();
+  std::lock_guard<std::mutex> lk(slot->mu);
+  if (!slot->open.load(std::memory_order_relaxed)) return Status();
+  RETURN_IF_ERROR(slot->writer.sync());
+  const uint64_t n = slot->writer.size();
+  slot->visible.store(n, std::memory_order_release);
+  slot->durable.store(n, std::memory_order_release);
+  RETURN_IF_ERROR(slot->writer.close());
+  slot->open.store(false, std::memory_order_release);
   return Status();
 }
 
-Status IngestSession::finish() {
-  if (!has_writer_) return Status();
-  RETURN_IF_ERROR(writer_.sync());
-  RETURN_IF_ERROR(writer_.close());
-  has_writer_ = false;
+void IngestSession::note_reference(std::map<uint32_t, uint64_t>* referenced,
+                                   const Location& loc) {
+  const uint64_t end = static_cast<uint64_t>(loc.offset) + ChunkHeader::kSize + loc.length;
+  auto it = referenced->find(loc.container_id);
+  if (it == referenced->end() || it->second < end) (*referenced)[loc.container_id] = end;
+}
+
+// S4 across threads. A recipe may reference chunks written by OTHER sessions
+// whose containers we do not own, so durability has to be requested per
+// container rather than assumed for our own (CHALLENGES B11).
+Status IngestSession::make_referenced_durable(const std::map<uint32_t, uint64_t>& referenced) {
+  for (const auto& [cid, end] : referenced) {
+    RETURN_IF_ERROR(store_->ensure_durable(cid, end));
+  }
   return Status();
 }
 
 Result<Location> IngestSession::write_chunk(const Digest32& fp, ByteSpan payload) {
-  if (!has_writer_ || !writer_.fits(payload.size())) {
-    if (has_writer_) {
-      // Roll over. The old container is synced and closed before we stop
-      // tracking it, so nothing that has already been indexed is left unflushed.
-      RETURN_IF_ERROR(writer_.sync());
-      RETURN_IF_ERROR(writer_.close());
-      has_writer_ = false;
-    }
-    ASSIGN_OR_RETURN(writer_, store_->new_container());
-    has_writer_ = true;
+  if (slot_ == nullptr || !slot_->writer.fits(payload.size())) {
+    if (slot_ != nullptr) RETURN_IF_ERROR(finish());  // roll over: sync, close, release
+    ASSIGN_OR_RETURN(slot_, store_->new_container());
     bytes_since_sync_ = 0;
   }
-  ASSIGN_OR_RETURN(const uint32_t offset, writer_.append(fp, payload));
+  uint32_t offset = 0;
+  {
+    // Per-container lock. Each session owns its own container, so this is
+    // uncontended in the common case; it exists so that another session's
+    // ensure_durable() can safely reach in and fsync.
+    std::lock_guard<std::mutex> lk(slot_->mu);
+    ASSIGN_OR_RETURN(offset, slot_->writer.append(fp, payload));
+    slot_->visible.store(slot_->writer.flushed(), std::memory_order_release);
+  }
   bytes_since_sync_ += ChunkHeader::kSize + payload.size();
-  if (bytes_since_sync_ >= kSyncEvery) RETURN_IF_ERROR(sync_container());
+  if (bytes_since_sync_ >= kSyncEvery) {
+    RETURN_IF_ERROR(store_->ensure_durable(slot_->writer.id(), slot_->writer.size()));
+    bytes_since_sync_ = 0;
+  }
 
   Location loc;
-  loc.container_id = writer_.id();
+  loc.container_id = slot_->writer.id();
   loc.offset = offset;
   loc.length = static_cast<uint32_t>(payload.size());
   return loc;
@@ -255,6 +327,8 @@ Result<IngestStats> IngestSession::ingest_bytes(const std::string& name, ByteSpa
   Chunker chunker(store_->opts_.chunker);
   Status first_error;
 
+  std::map<uint32_t, uint64_t> referenced;
+
   auto handle = [&](ByteSpan chunk) {
     if (!first_error.ok()) return;
     const Digest32 fp = sha256(chunk);
@@ -263,6 +337,7 @@ Result<IngestStats> IngestSession::ingest_bytes(const std::string& name, ByteSpa
     Location loc;
     if (store_->index_.lookup(fp, &loc)) {
       stats.chunks_deduped++;
+      note_reference(&referenced, loc);  // someone else's container may need syncing
     } else {
       auto written = write_chunk(fp, chunk);
       if (!written.ok()) {
@@ -274,6 +349,7 @@ Result<IngestStats> IngestSession::ingest_bytes(const std::string& name, ByteSpa
         first_error = ins.status();
         return;
       }
+      note_reference(&referenced, ins.value().loc);
       if (ins.value().inserted) {
         stats.chunks_new++;
         stats.physical_bytes += ChunkHeader::kSize + chunk.size();
@@ -310,7 +386,8 @@ Result<IngestStats> IngestSession::ingest_bytes(const std::string& name, ByteSpa
   // S4 -- ORDER. The chunks must be durable before the recipe that references
   // them exists, or a crash leaves a file that claims to exist and cannot be
   // read. write_file_atomic then fsyncs the recipe and its directory.
-  RETURN_IF_ERROR(sync_container());
+  // S4 -- ORDER, and across every container involved, not just our own.
+  RETURN_IF_ERROR(make_referenced_durable(referenced));
   RETURN_IF_ERROR(write_file_atomic(store_->recipe_path(name), recipe.encode()));
   return stats;
 }
@@ -327,6 +404,7 @@ Result<IngestStats> IngestSession::ingest_file(const std::string& name,
   Sha256 whole;
   Chunker chunker(store_->opts_.chunker);
   Status first_error;
+  std::map<uint32_t, uint64_t> referenced;
 
   auto handle = [&](ByteSpan chunk) {
     if (!first_error.ok()) return;
@@ -335,6 +413,7 @@ Result<IngestStats> IngestSession::ingest_file(const std::string& name,
     Location loc;
     if (store_->index_.lookup(fp, &loc)) {
       stats.chunks_deduped++;
+      note_reference(&referenced, loc);
     } else {
       auto written = write_chunk(fp, chunk);
       if (!written.ok()) {
@@ -346,6 +425,7 @@ Result<IngestStats> IngestSession::ingest_file(const std::string& name,
         first_error = ins.status();
         return;
       }
+      note_reference(&referenced, ins.value().loc);
       if (ins.value().inserted) stats.chunks_new++;
       else stats.chunks_deduped++;
       stats.physical_bytes += ChunkHeader::kSize + chunk.size();
@@ -379,7 +459,7 @@ Result<IngestStats> IngestSession::ingest_file(const std::string& name,
     return Status::error(Err::kInvalid, "ingest: chunker lost bytes");
   }
 
-  RETURN_IF_ERROR(sync_container());
+  RETURN_IF_ERROR(make_referenced_durable(referenced));
   RETURN_IF_ERROR(write_file_atomic(store_->recipe_path(name), recipe.encode()));
   return stats;
 }
@@ -413,6 +493,11 @@ Result<std::vector<uint8_t>> Store::read_chunk(const Digest32& fp) {
   if (!index_.lookup(fp, &loc)) {
     return Status::error(Err::kNotFound, "chunk " + to_hex(fp).substr(0, 16) + " not in index");
   }
+  // The record may still be sitting in an open writer's buffer, invisible to a
+  // reader. Flushing is enough here -- durability is the publish path's problem,
+  // readability is this one's.
+  const uint64_t end = static_cast<uint64_t>(loc.offset) + ChunkHeader::kSize + loc.length;
+  RETURN_IF_ERROR(ensure_visible(loc.container_id, end));
   ASSIGN_OR_RETURN(std::shared_ptr<ContainerReader> reader, reader_for(loc.container_id));
   return reader->read(loc.offset, loc.length, opts_.verify_fingerprint_on_read ? &fp : nullptr);
 }
@@ -497,8 +582,15 @@ Result<std::vector<Recipe>> Store::all_recipes() {
   std::vector<Recipe> out;
   for (const std::string& f : names) {
     if (f.size() < 4 || f.compare(f.size() - 4, 4, ".rcp") != 0) continue;
-    ASSIGN_OR_RETURN(std::vector<uint8_t> raw, read_file(path_join(recipes_dir(), f)));
-    ASSIGN_OR_RETURN(Recipe r, Recipe::decode(raw));
+    auto raw = read_file(path_join(recipes_dir(), f));
+    if (!raw.ok()) {
+      // A concurrent remove() between list_dir and read_file is an ordinary
+      // race, not an error: the file simply is not there any more. Any other
+      // failure still propagates.
+      if (raw.status().code() == Err::kNotFound) continue;
+      return raw.status();
+    }
+    ASSIGN_OR_RETURN(Recipe r, Recipe::decode(raw.take()));
     out.push_back(std::move(r));
   }
   return out;

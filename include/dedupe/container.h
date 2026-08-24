@@ -59,6 +59,11 @@ class ContainerWriter {
   // Appends one chunk. Returns the offset of its record header, which is what
   // goes into the index. kNoSpace when the container is full -- the caller rolls
   // to a new one rather than exceeding the 27-bit offset field.
+  //
+  // NOTE ON ERROR TIMING: appends are buffered, so a successful append() does not
+  // mean the bytes reached the kernel. I/O errors surface at flush()/sync()/
+  // close(). That is safe because a recipe is published only after a successful
+  // sync -- but it means callers must check the sync, not just the appends.
   Result<uint32_t> append(const Digest32& fp, ByteSpan payload);
 
   bool fits(size_t payload_len) const {
@@ -68,14 +73,29 @@ class ContainerWriter {
   uint32_t id() const { return id_; }
   const std::string& path() const { return file_.path(); }
 
-  Status sync() { return file_.sync(); }
-  Status close() { return file_.close(); }
+  // Push buffered records to the kernel. Makes them READABLE by other threads;
+  // does not make them durable.
+  Status flush();
+  // flush() + fsync: makes them DURABLE.
+  Status sync();
+  Status close();
+
+  // Bytes already handed to the kernel. size() - flushed() is what is still
+  // sitting in our own buffer.
+  uint64_t flushed() const { return flushed_; }
 
  private:
+  // One write() per chunk meant ~113k syscalls per GiB at the measured 9294 B
+  // mean chunk size. Batching into 1 MiB writes cuts that by ~113x. Correctness
+  // is unaffected: a record is only ever referenced by a recipe after a sync,
+  // and sync() flushes first.
+  static constexpr size_t kWriteBuffer = 1u << 20;
+
   File file_;
-  uint64_t size_ = 0;
+  uint64_t size_ = 0;      // logical end of the container, including buffered bytes
+  uint64_t flushed_ = 0;   // how much of that has reached the kernel
   uint32_t id_ = 0;
-  std::vector<uint8_t> scratch_;  // header+payload staging: one write() per chunk
+  std::vector<uint8_t> buf_;
 };
 
 class ContainerReader {

@@ -27,6 +27,7 @@ Result<ContainerWriter> ContainerWriter::create(const std::string& path, uint32_
   ContainerWriter w;
   w.file_ = std::move(f);
   w.size_ = ContainerHeader::kSize;
+  w.flushed_ = ContainerHeader::kSize;
   w.id_ = id;
   return w;
 }
@@ -41,6 +42,7 @@ Result<ContainerWriter> ContainerWriter::reopen(const std::string& path) {
   ContainerWriter w;
   w.file_ = std::move(f);
   w.size_ = scan.valid_bytes;
+  w.flushed_ = scan.valid_bytes;
   w.id_ = scan.header.container_id;
   return w;
 }
@@ -61,21 +63,44 @@ Result<uint32_t> ContainerWriter::append(const Digest32& fp, ByteSpan payload) {
   h.crc32c = crc32c(payload);
   h.fp = fp;
 
-  // Stage header+payload in one buffer so the record reaches the kernel in a
-  // single write(). Two writes would let a crash land between them far more
-  // often -- the tear would still be detected, but a record is cheaper to make
-  // atomic-ish than to recover.
-  scratch_.resize(ChunkHeader::kSize + payload.size());
-  h.encode(scratch_.data());
-  std::memcpy(scratch_.data() + ChunkHeader::kSize, payload.data(), payload.size());
-
+  // Append the whole record to the write buffer. Header and payload always go
+  // to the kernel together, so a crash cannot leave a header without its payload
+  // in the same write -- and if it does tear, scan() detects it anyway.
   const uint64_t offset = size_;
-  RETURN_IF_ERROR(file_.write_all(scratch_));
-  size_ += scratch_.size();
+  const size_t at = buf_.size();
+  buf_.resize(at + ChunkHeader::kSize + payload.size());
+  h.encode(buf_.data() + at);
+  std::memcpy(buf_.data() + at + ChunkHeader::kSize, payload.data(), payload.size());
+  size_ += ChunkHeader::kSize + payload.size();
+  if (buf_.size() >= kWriteBuffer) RETURN_IF_ERROR(flush());
   // Guaranteed by fits(): the container never exceeds 128 MiB, so this cast is
   // safe. Asserted rather than assumed, because the whole index depends on it.
   if (offset >= kContainerMaxBytes) return Status::invalid("container offset overflow");
   return static_cast<uint32_t>(offset);
+}
+
+Status ContainerWriter::flush() {
+  if (buf_.empty()) return Status();
+  // Drop exactly the prefix that reached the file, even on failure. Keeping the
+  // whole buffer after a partial write would re-send bytes the file already has,
+  // duplicating a fragment of a record mid-container -- damage that scan() can
+  // only respond to by truncating everything after it (CHALLENGES B12).
+  size_t done = 0;
+  const Status st = file_.write_all(buf_, &done);
+  flushed_ += done;
+  buf_.erase(buf_.begin(), buf_.begin() + static_cast<long>(done));
+  RETURN_IF_ERROR(st);
+  return Status();
+}
+
+Status ContainerWriter::sync() {
+  RETURN_IF_ERROR(flush());
+  return file_.sync();
+}
+
+Status ContainerWriter::close() {
+  RETURN_IF_ERROR(flush());
+  return file_.close();
 }
 
 // ---------------------------------------------------------------------------

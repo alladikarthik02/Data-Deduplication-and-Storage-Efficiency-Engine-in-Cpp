@@ -45,10 +45,6 @@ std::vector<uint8_t> composed_bytes(std::mt19937_64& rng, size_t n, size_t pool_
   return out;
 }
 
-struct FaultGuard {
-  ~FaultGuard() { faults::reset(); }
-};
-
 }  // namespace
 
 TEST(store_open_creates_layout) {
@@ -352,7 +348,7 @@ TEST(store_recovers_from_a_torn_container) {
 // container's fsync and the file must not appear at all: a file that exists but
 // cannot be read is strictly worse than one that was never created.
 TEST(store_does_not_publish_a_recipe_when_the_container_sync_fails) {
-  FaultGuard guard;
+  testing::FaultGuard guard;
   std::mt19937_64 rng(testing::seed() ^ 0x77);
   testing::TempDir dir;
   auto opened = Store::open(dir.file("store"));

@@ -56,7 +56,7 @@ dedupe --store <dir> ls | stats | verify [--deep]
 | T3 | On-disk formats + checked/injectable I/O layer | ✅ done |
 | T4 | Sharded memory-efficient fingerprint index | ✅ done |
 | T5 | Store: ingest + restore + CLI | ✅ done |
-| T6 | Concurrency: multi-threaded ingest | — |
+| T6 | Concurrency: multi-threaded ingest | ✅ done |
 | T7 | Background space reclamation (GC) | — |
 | T8 | Crash & fault injection | — |
 | T9 | Benchmarks — the résumé's numbers | — |

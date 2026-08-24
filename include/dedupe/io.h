@@ -49,6 +49,12 @@ const char* op_name(Op op);
 // fail with `code` instead of performing the operation.
 void fail_nth(Op op, uint64_t nth, Err code = Err::kIo);
 
+// TEST ONLY. Fail the `nth` call to `op` AND every call after it. Models a device
+// that has gone away rather than a single transient error -- the difference
+// matters, because a one-shot failure lets the next retry succeed and paper over
+// the very state a recovery test is trying to create.
+void fail_from(Op op, uint64_t nth, Err code = Err::kIo);
+
 // TEST ONLY. Arm the `nth` call to write/pwrite to transfer only half its bytes
 // and report success -- the short-write case a naive wrapper silently truncates on.
 void short_nth(Op op, uint64_t nth);
@@ -79,7 +85,11 @@ class File {
   const std::string& path() const { return path_; }
 
   // Appends `data` at the current offset, looping until every byte is written.
-  Status write_all(ByteSpan data);
+  // `out_done`, if given, receives the number of bytes that DID reach the file --
+  // including when this returns an error. Callers that buffer need that: after a
+  // partial write the file holds a prefix, and re-sending the whole buffer would
+  // duplicate it (CHALLENGES B12).
+  Status write_all(ByteSpan data, size_t* out_done = nullptr);
   // Writes at an absolute offset, looping until every byte is written.
   Status pwrite_all(ByteSpan data, uint64_t offset);
 

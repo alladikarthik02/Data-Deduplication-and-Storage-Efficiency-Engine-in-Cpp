@@ -342,3 +342,127 @@ nothing. Being *wrong loudly and cheaply* here cost one benchmark run; believing
 would have left 28% on the floor and a comment in the code claiming otherwise. Also: when
 a fast path underdelivers, check how often it is **taken** before you doubt the
 measurement that motivated it.
+
+---
+
+## B7 💾 32 bytes of every recipe were outside the checksum — found by flipping all of them
+
+**Symptom.** A test that flips every single byte of an encoded recipe and requires the
+decoder to reject all of them:
+
+```
+CHECK_EQ(caught, encoded.size())  got: 220  vs  252
+```
+
+220 of 252 flips detected. **32 bytes were silently accepted.**
+
+**How I isolated it.** 32 is a suspiciously meaningful number in this format — it is
+exactly a SHA-256 digest. A ten-line probe printed the undetected range:
+
+```
+encoded size=252  header=64  name=8
+UNDETECTED flips: 32, byte range [24..55]
+```
+
+Bytes 24..55 is precisely the `file_sha256` field of the recipe header.
+
+**Root cause.** I computed the body CRC over the body only:
+
+```c++
+put_u32le(out.data() + 60, crc32c(ByteSpan(body, body_size)));
+```
+
+The other header fields happen to be self-checking — a corrupted `magic` or `version`
+fails its own validation, and a corrupted `logical_size` or `chunk_count` fails the
+"chunk lengths must sum to logical_size" consistency check. `file_sha256` is the one
+field with **no independent way to tell whether it is right**, and it was the one field
+the checksum did not cover. Every byte of that format was protected except the byte
+range that most needed protection.
+
+**Why it matters more than it first looks.** `file_sha256` is the end-to-end restore
+check (S1). A flipped bit there does not corrupt the user's data — it corrupts the engine's
+*opinion* of the user's data, so a perfectly good restore reports a digest mismatch. That
+is arguably worse than a straightforward data error: it is a false alarm that an operator
+cannot distinguish from a real one, and the natural response to "restore says corrupt" is
+to reach for another copy.
+
+**Fix.** The CRC now covers the header as well as the body — everything except the four
+bytes of the CRC field itself, using the chaining property proven back in T1
+(`crc32c(b, crc32c(a)) == crc32c(a ++ b)`), so no buffer has to be copied to skip a hole:
+
+```c++
+uint32_t c = crc32c(ByteSpan(out.data(), 60));   // header, up to the CRC field
+c = crc32c(ByteSpan(body, body_size), c);        // body, skipping the field itself
+```
+
+All 252 flips are now caught. The random-mutation fuzz test's acceptance rate dropped from
+24/3000 to **1/3000** — and the one survivor is a mutation that happened to write a byte's
+existing value, i.e. not a mutation at all.
+
+**Generalizes to.** "Checksum the payload" is the intuitive rule and it is the wrong one;
+the rule is **checksum everything you cannot otherwise verify**. And the test that found
+this was not clever — it flipped every byte and demanded every flip be caught. Exhaustive
+beats representative when the input space is small enough to exhaust, and 252 bytes is
+very much small enough.
+
+---
+
+## B8 🐛 Three of my own tests were wrong (and one was wrong in an interesting way)
+
+Alongside B7, T3's first run produced four failures that were **defects in the tests, not
+the code**. Recorded because a journal that only lists code bugs quietly implies the tests
+are always right, and mine were not.
+
+**(a) Asserting a counter after zeroing it.**
+```
+CHECK_GT(faults::count(faults::Op::kWrite), 0)  got: 0 vs 0
+```
+I called `faults::reset()` — which zeroes the counters — and *then* asserted the write
+count was non-zero. The check was meant to prove the fault injection actually fired, so it
+now reads the counter before disarming, and asserts `>= 2` (one short write plus its
+retry) rather than `> 0`, which is the thing actually worth proving.
+
+**(b) A name used as both a directory and a file.**
+`write_file_atomic` failed inside a test that had earlier created a directory called `a`
+and then tried to write a *file* called `a`. `rename()` onto an existing directory fails
+with `EISDIR`. The engine behaved perfectly; my fixture was self-contradictory.
+
+**(c) `!fits(1)` — asserting the wrong notion of "full".**
+The container-capacity test filled a container with 131071-byte chunks until it refused,
+then asserted no further chunk of any size would fit. But "full" is relative to what is
+being offered: ~83 KB of slack remained, so a max-size chunk no longer fit while a 1-byte
+chunk still would. Now it asserts `!fits(kMaxChunkLength) && fits(1)`, which is both true
+and a more precise statement of the behaviour.
+
+**(d) The interesting one: conflating "a record was lost" with "damage is detectable".**
+
+The torn-tail test truncates a container at *every* byte offset inside its last record and
+checks recovery at each one. It failed at exactly one offset — the one where the cut lands
+**precisely on the record boundary**:
+
+```
+CHECK_EQ(rec.value().torn, expect_torn)  got: false  vs  true  [truncated to 2832 of 3392]
+```
+
+My model was `torn = (cut != full)`. The code's answer was better than my model. Cutting
+exactly at a boundary leaves a container of five complete, CRC-valid records — **byte for
+byte indistinguishable from one that was only ever five records long**. There is nothing
+to detect, because nothing is damaged; a record was simply never written.
+
+That is not a gap in the format, it is the honest limit of what any append-only log can
+tell you, and it is worth being precise about: a container's own bytes can prove *"nothing
+here is damaged"*, and can never prove *"nothing is missing from the end"*. Knowing whether
+a chunk should exist is the recipe's job, not the container's — which is exactly the
+division of responsibility SPEC §3.0 sets up, arrived at here from the opposite direction.
+
+The test now tracks the two properties separately:
+```c++
+const bool complete    = (cut == full);
+const bool expect_torn = !complete && (cut != last_record_start);
+```
+
+**Generalizes to.** When a test fails at exactly one point in an otherwise-passing sweep,
+the single point is usually a boundary your model smoothed over — check whether the code is
+right before "fixing" it. Sweeping every offset instead of three hand-picked ones is what
+surfaced it; a test with three cases would have missed this and left me believing a
+falsehood about my own format.

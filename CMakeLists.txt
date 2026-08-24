@@ -33,12 +33,22 @@ endif()
 
 include_directories(${CMAKE_SOURCE_DIR}/include ${CMAKE_SOURCE_DIR}/tests)
 
+# --- core library -----------------------------------------------------------
+# Everything with a real implementation lives here; the primitives (sha256,
+# crc32c, chunker) stay header-only because they are hot and want inlining.
+add_library(dedupe_core STATIC
+  src/io.cpp
+  src/format.cpp
+  src/container.cpp
+)
+target_link_libraries(dedupe_core PUBLIC pthread)
+
 enable_testing()
 
 # One line per suite. Keeps later tasks from touching build plumbing.
 function(dedupe_test name)
   add_executable(${name} tests/${name}.cpp ${ARGN})
-  target_link_libraries(${name} PRIVATE pthread)
+  target_link_libraries(${name} PRIVATE dedupe_core pthread)
   add_test(NAME ${name} COMMAND ${name})
 endfunction()
 
@@ -52,7 +62,14 @@ dedupe_test(test_crc32c)
 # --- T2: chunking ------------------------------------------------------------
 dedupe_test(test_chunker)
 
+# --- T3: on-disk formats and I/O ---------------------------------------------
+dedupe_test(test_io)
+dedupe_test(test_format)
+dedupe_test(test_container)
+
 # Benchmarks are built, not run, by ctest -- they are measurements, not pass/fail
 # gates. Run them explicitly:  ./build-none/bench_hash
 add_executable(bench_hash bench/bench_hash.cpp)
+target_link_libraries(bench_hash PRIVATE dedupe_core)
 add_executable(bench_chunker bench/bench_chunker.cpp)
+target_link_libraries(bench_chunker PRIVATE dedupe_core)

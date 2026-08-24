@@ -39,7 +39,7 @@ Randomized tests are seeded and print the seed; replay a failure with
 |---|---|---|
 | T0 | Foundations: container, CMake+CTest, test harness, spec, bug journal | ✅ done |
 | T1 | SHA-256 + CRC32C fingerprinting, runtime-dispatched hardware backends | ✅ done |
-| T2 | FastCDC content-defined chunker | — |
+| T2 | FastCDC content-defined chunker | ✅ done |
 | T3 | On-disk formats + checked/injectable I/O layer | — |
 | T4 | Sharded memory-efficient fingerprint index | — |
 | T5 | Store: ingest + restore + CLI | — |

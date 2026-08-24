@@ -49,6 +49,10 @@ dedupe_test(test_harness)
 dedupe_test(test_sha256)
 dedupe_test(test_crc32c)
 
+# --- T2: chunking ------------------------------------------------------------
+dedupe_test(test_chunker)
+
 # Benchmarks are built, not run, by ctest -- they are measurements, not pass/fail
 # gates. Run them explicitly:  ./build-none/bench_hash
 add_executable(bench_hash bench/bench_hash.cpp)
+add_executable(bench_chunker bench/bench_chunker.cpp)

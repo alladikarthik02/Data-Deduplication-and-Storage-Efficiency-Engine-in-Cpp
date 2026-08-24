@@ -220,3 +220,125 @@ check value) available before a line was written, so the tests were written agai
 external truth rather than against my own implementation. Later tasks — the chunker,
 the index, GC — have no such oracle, which is precisely why they will need differential
 and property tests instead, and why this journal should get longer from here.
+
+---
+
+## B5 🔬 "AvgSize = 8 KiB" produces 9.3 KiB chunks — the parameter is not the average
+
+**Symptom.** The first distribution measurement, on 8 MiB of random data:
+
+```
+n=905  mean=9267 B  p1=2540  p50=9235  p99=16040  max=22788  at_max=0.00%  at_min=0.00%
+```
+
+The chunker is configured with `avg_size = 8192`. The mean is **13% higher**.
+
+**Why this mattered enough to chase.** SPEC §3.4 derives everything from chunk size:
+index RAM per byte of data, recipe metadata overhead, the 8 TiB capacity claim. If the
+chunker's real average were unknown, every one of those numbers would be decoration.
+SPEC §8.8 was written specifically to say "this is an assumption until measured" — this
+is that measurement coming back different from the assumption.
+
+**Hypotheses.**
+- (H1) The masks are wrong — wrong bit counts, or I swapped strict and loose. —
+  *Testable:* `popcount(mask_s)` must be 15 and `popcount(mask_l)` 11, and the strict
+  one must apply *before* the average. Both checked out.
+- (H2) Cut-point skipping is double-counting: `MinSize` bytes skipped *and* then added
+  again. — *Rejected:* the tiling test (`chunker_is_complete_and_lossless`) proves the
+  chunks sum exactly to the input length, so nothing is being counted twice.
+- (H3) 8192 is not supposed to be the mean at all. — Correct.
+
+**Root cause.** `AvgSize` in FastCDC is the point where the mask *switches*, not a target
+the algorithm steers toward. The expected length is the sum of three independent pieces:
+
+```
+E[len] = MinSize                                  2048.0   (skipped, never tested)
+       + E[min(Exp(1/2^15), AvgSize − MinSize)]   5602.4   (reluctant, 15-bit mask)
+       + P(no cut there) × 2^11                   1697.9   (eager, 11-bit mask)
+       =                                          9348.2 B
+```
+
+Measured 9294 B on 64 MiB. **0.58% error** against a model derived from first
+principles — which is the strongest evidence available that the implementation is doing
+exactly what the algorithm specifies, and that the surprise was in my reading of the
+parameter, not in the code.
+
+**Fix.** No code change. The *spec* was wrong, so the spec changed: §3.4's memory
+arithmetic now uses the measured 9294 B. Every derived figure moved in the *favourable*
+direction, which is worth stating explicitly so it does not read as motivated reasoning:
+
+| | assumed 8192 B | measured 9294 B |
+|---|---:|---:|
+| index cost as % of data | 0.521% | **0.459%** |
+| recipe overhead | 0.439% | **0.387%** |
+| index RAM per TiB of unique data | 5.33 GiB | **4.70 GiB** |
+
+The same model also explains a second observation: `P(chunk forced out at MaxSize)` =
+5.7 × 10⁻¹³ on random data. MaxSize is therefore not a size control at all on real
+input — it is a **bound for pathological input**, and the all-zeros test proves it does
+that job (a 1 MiB run of a single byte gives the gear hash no entropy, no cut is ever
+found, and all 16 chunks come out at exactly 64 KiB).
+
+**Generalizes to.** When a measurement disagrees with a parameter's *name*, build the
+analytic model before touching the code — if the model reproduces the measurement, the
+code is right and your understanding was wrong. And: a spec figure that was flagged as
+an assumption is not a liability, it is a debt you scheduled. §8.8 existed precisely so
+this would be checked instead of discovered later by a capacity-planning failure.
+
+---
+
+## B6 🐛 My first optimization was measurably useless — the fast path never fired
+
+**Symptom.** The chunker's streaming path measured 1352.6 MB/s against 1884.5 MB/s for
+the raw zero-copy scan. The copy into the carry buffer was eating 28%. I added the
+obvious fast path:
+
+```c++
+if (buf_.empty() && data.size() >= p_.max_size) { /* chunk in place, skip the copy */ }
+```
+
+Result: **1352.6 → 1352.6 ... 1377 MB/s.** A 2.7% change, i.e. noise. The 28% was still
+there.
+
+**Hypotheses.**
+- (H1) The copy was never the real cost; I mis-attributed the gap. — Plausible, and it
+  is the hypothesis that would have sent me off to profile the gear loop instead. Worth
+  taking seriously precisely because it would have wasted the most time.
+- (H2) The fast path is correct but rarely taken. — Checkable in seconds by reasoning
+  about the state, no profiler needed.
+
+**How I isolated it.** No instrumentation — just reading the state machine. `buf_` holds
+whatever is left after the last cut. A chunk boundary essentially never lands exactly on
+a read boundary, so after **any** feed, `buf_` holds a partial chunk and is non-empty.
+The condition `buf_.empty()` is therefore true exactly once, on the very first feed. The
+fast path was running for 1 MiB out of 64 MiB: 1/64th of the data, which is almost
+precisely the 2.7% observed.
+
+**Root cause.** I optimized for the state that occurs once instead of the state that
+occurs always. The invariant of a streaming chunker is that the buffer is *never* empty
+between feeds — that is the whole reason the buffer exists.
+
+**Fix.** Copy only the **splice region**: the carry plus MaxSize bytes of new data, which
+is provably enough to resolve the chunk straddling the read boundary. Then chunk the
+remainder of the caller's buffer in place and copy only the leftover tail. Per 1 MiB read
+that is ~128 KiB copied instead of 1 MiB.
+
+The "provably enough" is the load-bearing part, so here it is: while the scan position is
+at or before the end of the carry, the remaining spliced span is at least MaxSize bytes,
+so every cut found there is already final (a boundary is forced at MaxSize regardless of
+what follows). The loop therefore cannot stop before it has consumed past the carry.
+
+| | before | after | |
+|---|---:|---:|---|
+| `Chunker::feed` (1 MiB reads) | 1352.6 MB/s | **1805.9 MB/s** | **+33.5%** |
+| chunk + sha256 (full ingest CPU) | 808.6 MB/s | **966.1 MB/s** | +19.5% |
+
+Now within 4% of the zero-copy ceiling, with bit-identical chunk boundaries (7221 chunks
+before and after — the equivalence test compares both lengths *and* bytes).
+
+**Generalizes to.** An optimization is a hypothesis, and it needs the same before/after
+measurement as any other claim — mine was plausible, compiled, passed every test, and did
+nothing. Being *wrong loudly and cheaply* here cost one benchmark run; believing it
+would have left 28% on the floor and a comment in the code claiming otherwise. Also: when
+a fast path underdelivers, check how often it is **taken** before you doubt the
+measurement that motivated it.

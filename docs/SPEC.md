@@ -107,6 +107,10 @@ suite so a future toolchain change that breaks one of these fails loudly.
 | `__ARM_FEATURE_CRC32` at default `-march` | **not defined**, though `AT_HWCAP` says the CPU has CRC32 **and** SHA-2 | Forces **runtime** feature dispatch instead of `-march=armv8-a+crc`; see `CHALLENGES.md` B3. |
 | SHA-256 throughput | scalar **123.9 MB/s** → ARMv8 SHA-2 **2073.9 MB/s** (16.7×) | Was the ceiling on all ingest throughput; see `CHALLENGES.md` B4 and `BENCHMARKS.md`. |
 | CRC32C throughput | table **2084.7 MB/s** → ARMv8 CRC32 **8055.5 MB/s** (3.9×) | Makes per-read integrity verification affordable (§3.3). |
+| Mean chunk size at Min/Avg/Max = 2K/8K/64K | **9294 B**, not 8192 — predicted 9348 B analytically, 0.58% error | Every memory/overhead figure in §3.4 derives from it; see `CHALLENGES.md` B5. |
+| Chunks forced out at MaxSize (random data) | **0.00%** (model: 5.7e-13) | MaxSize is a bound for pathological input, not a size control. |
+| Boundary preservation after a 1-byte insert at offset 0 | CDC **99.9%** vs fixed-size **0.0%** | R1.1, the property the whole engine rests on. |
+| Chunking throughput | scan **1884.5 MB/s**; streaming **1805.9 MB/s**; chunk+SHA-256 **966.1 MB/s** | The ingest CPU budget. |
 
 ---
 
@@ -183,6 +187,17 @@ adds two refinements we implement:
 | `MaskS` | 15 bits set | Strict mask, used while `len < AvgSize`. |
 | `MaskL` | 11 bits set | Loose mask, used while `len ≥ AvgSize`. |
 
+**`AvgSize` is the mask switch point, not the resulting mean.** Measured mean chunk size
+is **9294 B**, matching a first-principles model (2048 skipped + 5602 expected in the
+reluctant region + 1698 in the eager region = 9348 B) to within 0.58%. Everything in §3.4
+below uses the measured 9294 B, not the nominal 8192. Full derivation and the consequences
+in `CHALLENGES.md` B5; distribution table in `BENCHMARKS.md`.
+
+**Streaming copy budget.** The chunker copies only the *splice region* — the carried
+partial chunk plus MaxSize bytes of new data, provably enough to resolve the chunk
+straddling a read boundary — and cuts the rest of the caller's buffer in place. The naive
+copy-everything design measured 28% slower (`CHALLENGES.md` B6).
+
 ### 3.2 Fingerprinting — SHA-256, in-tree
 
 **Why SHA-256.** Content addressing means "same fingerprint ⇒ same bytes" is a *correctness*
@@ -243,7 +258,7 @@ header is short, whose magic is wrong, or whose CRC fails.
 **Recipe file:** 64-byte header (`magic`, version, logical file size, chunk count, whole-file
 SHA-256, source-name length) + name bytes + `chunk_count × {fp[32], length u32}`.
 
-Metadata overhead: 36 B per 8 KiB chunk ≈ **0.44%** of logical size. We store the full 32-byte
+Metadata overhead: 36 B per chunk ≈ **0.387%** of logical size at the measured 9294 B mean. We store the full 32-byte
 fingerprint rather than an 8-byte index ID so a recipe stays meaningful after a full index rebuild,
 and so restore can verify end-to-end (S1). The overhead is the price of that independence, and it is
 written down here so it is a decision rather than an accident.
@@ -286,8 +301,9 @@ Design choices and their reasons:
 - **Max load factor 0.75**, capacity a power of two, index = `k0 & (cap-1)`. Empty slot = `k0==0 &&
   k1==0` (a fingerprint with 128 leading zero bits is not going to happen; asserted anyway).
 
-Expected cost: 32 B/entry ÷ 0.75 load ≈ **~43 B of RAM per stored chunk**, i.e. ~0.52% of logical
-data at 8 KiB chunks. 1 TiB of unique data ≈ 5.6 GiB of index. §8.3 is honest about what that means.
+Expected cost: 32 B/entry ÷ 0.75 load ≈ **42.7 B of RAM per stored chunk**. At the *measured*
+mean chunk size of 9294 B (§3.1, not the nominal 8192) that is **0.459% of logical data**, so
+1 TiB of unique data needs **≈4.70 GiB** of index. §8.3 is honest about what that means.
 
 ### 3.5 Concurrency model
 
@@ -517,9 +533,14 @@ The birthday math in §3.4 assumes fingerprints are uniformly distributed — tr
 for a weak hash. The number and the hash choice are therefore coupled; changing the hash invalidates
 the key width. Written down so nobody "optimizes" the hash later without redoing the arithmetic.
 
-### 8.8 Chunk-size distribution is an assumption until measured
+### 8.8 Chunk-size distribution is an assumption until measured — ✅ RESOLVED in T2
 
-All the RAM/overhead arithmetic above assumes the chunker actually produces ~8 KiB average chunks.
-Rolling-hash chunkers routinely miss their target on real data (long runs of zeros, highly structured
-binaries). T2 therefore *reports the measured distribution* — mean, p1, p50, p99, max, and the
-fraction hitting `MaxSize` — before any of §3.4's numbers are quoted as real.
+All the RAM/overhead arithmetic above assumed the chunker produces ~8 KiB average chunks.
+It does not: the measured mean is **9294 B**, because `AvgSize` names the mask switch point
+rather than a target. The assumption was wrong by 13% and every derived figure in §3.4 has
+been corrected (all of them moved favourably). The measured distribution — mean, p1, p50,
+p99, max, `at_max`, `at_min` — is in `BENCHMARKS.md`, reproduced by `test_chunker`, and the
+analytic model that predicts it to within 0.58% is in `CHALLENGES.md` B5.
+
+This hole existing in the spec is why the number got checked instead of being discovered
+later as a capacity-planning failure.

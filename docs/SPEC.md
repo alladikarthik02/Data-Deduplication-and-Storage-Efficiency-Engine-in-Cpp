@@ -66,11 +66,11 @@
 
 | ID | Requirement | Proven by |
 |---|---|---|
-| R2.1 | GC runs on a **background thread**, triggered by policy or by `dedupe gc`. | `src/gc.cpp` + `test_gc`. |
-| R2.2 | GC **frees** space: after deleting files, physical bytes on disk actually shrink. | `test_gc`: assert container bytes drop by the expected amount. |
-| R2.3 | GC is **safe**: it never frees a chunk that any surviving recipe references. See **S2**. | `test_gc_stress`: concurrent ingest + delete + GC, then restore *every* surviving file and byte-compare. |
-| R2.4 | GC runs **concurrently** with reads and writes. | `test_gc_stress` runs ingest and restore threads for the entire GC cycle with no external barrier. T6 laid the foundation: 4-thread ingest, concurrent restore-during-ingest, and concurrent `list`/`stats` during churn, all TSan-clean. |
-| R2.5 | GC does not **block** foreground operations. | `bench/gc_latency`: measure foreground p50/p99/p99.9 ingest latency with GC idle vs GC running; assert p99 inflation stays under a stated bound, and report the real number. |
+| R2.1 | GC runs on a **background thread**, triggered by policy or by `dedupe gc`. | ✅ `Gc::start()/stop()`, plus `run_once()` so tests are deterministic. |
+| R2.2 | GC **frees** space: after deleting files, physical bytes on disk actually shrink. | ✅ `gc_reclaims_space_from_a_deleted_file` (3.5 MB → 0.4 MB) and `gc_compacts_a_mostly_dead_container` (copy-forward, >2× shrink). |
+| R2.3 | GC is **safe**: it never frees a chunk that any surviving recipe references. See **S2**. | ✅ `test_gc_stress`: 3 ingest + 2 restore threads against a live collector, every survivor byte-compared, plus 30 delete/re-ingest resurrection rounds. Found three real defects (B13, B15) and one bad oracle (B14) before it passed. |
+| R2.4 | GC runs **concurrently** with reads and writes. | ✅ `test_gc_stress` runs ingest/restore/delete threads for the whole cycle with no external barrier, TSan-clean. |
+| R2.5 | GC does not **block** foreground operations. | ✅ `bench_gc`, independent store per configuration, n=2000: ingest and restore latency within ±20% of idle at p50/p90/p99, often better. A loose 5× guard runs in `test_gc` (skipped under sanitizers, where wall-clock comparison is meaningless). |
 
 > **R3.** "Tuned the chunking and indexing path with a memory-efficient fingerprint index, holding
 > deduplication throughput steady as the dataset grew, and validating correctness through an
@@ -373,22 +373,47 @@ Phase 3  COMPACT for each container with live_bytes/total < 0.5:
                    journal DONE
 ```
 
-**The safety argument, stated so it can be attacked:** a chunk is freed only if *no recipe references
-it* **and** *nothing touched it since the epoch fence*. Any chunk written or hit during the GC cycle
-has `touch_epoch ≥ epoch_start` and is therefore ineligible, even if the mark phase never saw it.
-A recipe published mid-scan may be missed by MARK — but every chunk it references was necessarily
-touched after the fence, so the epoch clause saves it. The failure mode of this design is
-**retaining garbage for one extra cycle**, never freeing live data. Conservatism is deliberately
+**The safety argument, stated so it can be attacked — and it was.** A chunk is freed only if *no
+recipe references it* **and** *nothing touched it since the reclaim watermark*.
+
+The first version of this argument used the fence itself as the watermark, and was **wrong**. It
+claimed that a recipe published mid-scan is safe because "every chunk it references was necessarily
+touched after the fence". That holds only for ingests that *start* after the fence. An ingest
+already running stamps its chunks when it **looks them up** and publishes the recipe much later, so
+a fence taken in between sees a chunk that is neither marked (no recipe yet) nor recent (stamped
+before the fence) and frees it out from under a live file. The GC stress suite destroyed data on its
+first run because of this (`CHALLENGES.md` B13).
+
+The correct rule adds a **reclaim watermark**: an ingest registers the epoch it began in, and
+
+```
+safe_epoch = min(fence, oldest in-flight ingest's start epoch)
+```
+
+GC never *waits* for an ingest; it declines to collect anything an ingest might still be counting
+on. Registration and the fence are taken under one lock, or an ingest could read the old epoch,
+see GC fence against an empty active set, and only then register. With that, the failure mode of
+this design is **retaining garbage for one extra cycle**, never freeing live data — conservatism
 aimed in the direction where a bug costs space, not data.
+
+**A second, cheaper guard, learned the hard way.** A container that scans as *empty* is skipped
+rather than deleted. It should be impossible for a container holding live chunks to scan as empty —
+and it happened anyway, because `ContainerReader` caches its file size and `scan()` was not
+refreshing it (`CHALLENGES.md` B15). Deleting is irreversible; skipping costs one wasted container
+until the next cycle.
 
 **Crash safety of compaction:** the source container is unlinked only *after* the COMMIT record is
 durable. Crash before COMMIT → the orphaned destination is discarded on recovery, source is intact.
 Crash after COMMIT, before DONE → recovery re-points the index (rebuilt by scanning) and finishes the
 unlink. Both paths are idempotent.
 
-**Not blocking the foreground (R2.5):** GC's per-lock critical sections are bounded to a fixed batch
-of entries; it never holds a shard lock across I/O; it never takes two shard locks. Measured, not
-assumed — `bench/gc_latency` reports foreground p99 with GC on vs off.
+**Not blocking the foreground (R2.5):** MARK takes a *shared* lock per chunk reference (marking is
+not a structural change); SWEEP walks each shard in bounded batches, releasing the lock between them;
+COMPACT does every byte of its I/O with no index lock held and takes a short exclusive lock per
+repointed chunk. GC never holds two shard locks at once and never holds one across I/O.
+✅ **Measured** (`BENCHMARKS.md` T7): foreground ingest and restore latency with the collector
+running is **within ±20% of idle at p50/p90/p99, and frequently better** — collecting garbage
+shrinks the store the foreground is working in. Holds even at 316 GC cycles during the window.
 
 ---
 
@@ -432,7 +457,7 @@ dedupe --store <dir> bench <subcommand>    # reproducible measurements
 | `bench/gen_backup_corpus` | Generates the reproducible "representative backup dataset" of §8.1 from a seed. |
 | `bench/index_mem` | Our index vs `std::unordered_map` baseline, both measured (R3.1). |
 | `bench/scaling` | Throughput at growing dataset sizes (R3.2). |
-| `bench/gc_latency` | Foreground latency with GC idle vs running (R2.5). |
+| `bench/bench_gc` | Foreground latency with GC idle vs running, independent store per configuration (R2.5). |
 | `tools/crashtest` | Forks a child, kills it at a chosen sync point, reopens the store, verifies (S3). |
 
 ---

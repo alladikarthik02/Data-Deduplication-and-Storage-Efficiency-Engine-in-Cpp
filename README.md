@@ -9,6 +9,8 @@ references any more, while ingests and restores keep running.
   requirements (S1–S14), task breakdown.
 - **Bug journal:** [`docs/CHALLENGES.md`](docs/CHALLENGES.md) — every bug hit while
   building this, with the reasoning, including the wrong hypotheses.
+- **Measurements:** [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) — every number, with the
+  command that produced it.
 
 ## Build and test
 
@@ -36,7 +38,7 @@ Randomized tests are seeded and print the seed; replay a failure with
 | Task | What | State |
 |---|---|---|
 | T0 | Foundations: container, CMake+CTest, test harness, spec, bug journal | ✅ done |
-| T1 | SHA-256 + CRC32C fingerprinting | — |
+| T1 | SHA-256 + CRC32C fingerprinting, runtime-dispatched hardware backends | ✅ done |
 | T2 | FastCDC content-defined chunker | — |
 | T3 | On-disk formats + checked/injectable I/O layer | — |
 | T4 | Sharded memory-efficient fingerprint index | — |

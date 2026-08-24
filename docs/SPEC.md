@@ -104,6 +104,9 @@ suite so a future toolchain change that breaks one of these fails loudly.
 | `sizeof(ChunkHeader)` | **48 bytes**, no padding | §3.3's record layout and its offset table. |
 | `std::atomic<uint32_t/uint64_t>` | lock-free | S7: if atomics fell back to a mutex, "GC never blocks the foreground" would be quietly false. |
 | Location packing `c:16 \| o:27 \| l:17` | round-trips at every boundary; capacity = **8 TiB** | §3.4's addressability claim, verified arithmetically rather than asserted. |
+| `__ARM_FEATURE_CRC32` at default `-march` | **not defined**, though `AT_HWCAP` says the CPU has CRC32 **and** SHA-2 | Forces **runtime** feature dispatch instead of `-march=armv8-a+crc`; see `CHALLENGES.md` B3. |
+| SHA-256 throughput | scalar **123.9 MB/s** → ARMv8 SHA-2 **2073.9 MB/s** (16.7×) | Was the ceiling on all ingest throughput; see `CHALLENGES.md` B4 and `BENCHMARKS.md`. |
+| CRC32C throughput | table **2084.7 MB/s** → ARMv8 CRC32 **8055.5 MB/s** (3.9×) | Makes per-read integrity verification affordable (§3.3). |
 
 ---
 
@@ -191,6 +194,17 @@ trivially collidable, and a collision here means **silent data corruption**, not
 **Why in-tree, not OpenSSL.** No hidden dependencies (same rule as previous projects), and a
 from-scratch SHA-256 is verifiable against published NIST vectors, which is a stronger correctness
 story than "linked a library." Cost is ~250 lines.
+
+**Two backends, one answer.** SHA-256 is implemented twice: a portable scalar path and
+an ARMv8 SHA-2 extension path, chosen at **runtime** from `AT_HWCAP` (never by
+`-march`, which would produce a binary that `SIGILL`s on CPUs without the extension).
+The measured gap is 16.7×, and since fingerprinting is unavoidable work on every
+ingested byte, that gap was the ceiling on the whole engine's throughput. The
+correctness obligation this creates is explicit: the two backends must agree bit-for-bit
+or a store written on one machine is unreadable on another, so they are differentially
+tested against each other at every length across the block and padding boundaries — not
+merely each checked against the NIST vectors. Same reasoning, same pattern, for CRC32C's
+three implementations. (`CHALLENGES.md` B3, B4.)
 
 **Threat model note:** this is not a security boundary. We assume a non-adversarial ingest stream. If
 an attacker could choose ingested bytes *and* SHA-256 were broken, a chosen-collision could alias two

@@ -95,7 +95,7 @@ Result<ContainerReader> ContainerReader::open(const std::string& path) {
   ContainerReader r;
   r.file_ = std::move(f);
   r.header_ = h;
-  r.file_size_ = sz;
+  r.file_size_.store(sz, std::memory_order_relaxed);
   return r;
 }
 
@@ -107,10 +107,17 @@ Result<std::vector<uint8_t>> ContainerReader::read(uint32_t offset, uint32_t len
   const uint64_t need = static_cast<uint64_t>(offset) + ChunkHeader::kSize + length;
   // Bounds-check against the real file size before issuing the read, so a
   // corrupt index entry produces an error instead of a wild read (S9).
-  if (need > file_size_) {
+  if (need > file_size_.load(std::memory_order_relaxed)) {
+    // The container may have grown since we opened it -- an ingest thread can be
+    // appending while this reader is live. Refresh once before concluding the
+    // index is wrong.
+    ASSIGN_OR_RETURN(const uint64_t now, file_.size());
+    file_size_.store(now, std::memory_order_relaxed);
+  }
+  if (need > file_size_.load(std::memory_order_relaxed)) {
     return Status::corrupt("read: record at " + std::to_string(offset) + "+" +
                            std::to_string(length) + " runs past end of " + file_.path() + " (" +
-                           std::to_string(file_size_) + " bytes)");
+                           std::to_string(file_size_.load()) + " bytes)");
   }
 
   std::vector<uint8_t> buf(ChunkHeader::kSize + length);
@@ -143,9 +150,10 @@ Result<ScanResult> ContainerReader::scan() {
   out.header = header_;
   out.valid_bytes = ContainerHeader::kSize;
 
+  const uint64_t file_size = file_size_.load(std::memory_order_relaxed);
   uint64_t pos = ContainerHeader::kSize;
   std::vector<uint8_t> buf;
-  while (pos < file_size_) {
+  while (pos < file_size) {
     uint8_t hdr[ChunkHeader::kSize];
     ASSIGN_OR_RETURN(const size_t got, file_.pread_upto(hdr, sizeof(hdr), pos));
     if (got < ChunkHeader::kSize) {
@@ -161,7 +169,7 @@ Result<ScanResult> ContainerReader::scan() {
       break;
     }
     const uint32_t length = h.value().length;
-    if (pos + ChunkHeader::kSize + length > file_size_) {
+    if (pos + ChunkHeader::kSize + length > file_size) {
       out.torn = true;
       out.tear_reason = "payload truncated at offset " + std::to_string(pos);
       break;

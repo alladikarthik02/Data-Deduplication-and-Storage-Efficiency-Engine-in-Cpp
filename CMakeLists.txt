@@ -41,6 +41,7 @@ add_library(dedupe_core STATIC
   src/format.cpp
   src/container.cpp
   src/index.cpp
+  src/store.cpp
 )
 target_link_libraries(dedupe_core PUBLIC pthread)
 
@@ -70,6 +71,13 @@ dedupe_test(test_container)
 
 # --- T4: the fingerprint index -----------------------------------------------
 dedupe_test(test_index)
+
+# --- T5: the store ------------------------------------------------------------
+dedupe_test(test_store)
+
+# The CLI.
+add_executable(dedupe tools/dedupe_cli.cpp)
+target_link_libraries(dedupe PRIVATE dedupe_core)
 
 # Benchmarks are built, not run, by ctest -- they are measurements, not pass/fail
 # gates. Run them explicitly:  ./build-none/bench_hash

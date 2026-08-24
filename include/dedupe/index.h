@@ -140,7 +140,10 @@ class Index {
   static constexpr double kMaxLoad = 0.90;   // safe at this load thanks to Robin Hood
   static constexpr double kGrowthFactor = 1.5;  // not 2.0 -- see CHALLENGES B10
 
-  explicit Index(size_t initial_slots_per_shard = 64);
+  // 16 slots x 256 shards = a 128 KiB floor. Worth keeping small: a store with a
+  // few hundred chunks should not report megabytes of index. Growth is 1.5x, so
+  // the early rehashes are cheap and geometric.
+  explicit Index(size_t initial_slots_per_shard = 16);
   Index(const Index&) = delete;
   Index& operator=(const Index&) = delete;
 

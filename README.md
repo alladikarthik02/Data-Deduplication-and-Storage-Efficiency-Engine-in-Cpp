@@ -33,6 +33,19 @@ TSan (data races, S6). For a single configuration:
 Randomized tests are seeded and print the seed; replay a failure with
 `DEDUPE_SEED=0x... ./build-none/test_roundtrip`.
 
+## Try it
+
+```bash
+./scripts/dev.sh bash -c './build-none/dedupe --store /tmp/s ingest myfile.bin && ./build-none/dedupe --store /tmp/s stats'
+```
+
+```
+dedupe --store <dir> ingest <file> [name]   # add a file
+dedupe --store <dir> restore <name> <out>   # rebuild it, byte-exact
+dedupe --store <dir> rm <name>              # delete (space returns via gc)
+dedupe --store <dir> ls | stats | verify [--deep]
+```
+
 ## Status
 
 | Task | What | State |
@@ -42,7 +55,7 @@ Randomized tests are seeded and print the seed; replay a failure with
 | T2 | FastCDC content-defined chunker | ✅ done |
 | T3 | On-disk formats + checked/injectable I/O layer | ✅ done |
 | T4 | Sharded memory-efficient fingerprint index | ✅ done |
-| T5 | Store: ingest + restore + CLI | — |
+| T5 | Store: ingest + restore + CLI | ✅ done |
 | T6 | Concurrency: multi-threaded ingest | — |
 | T7 | Background space reclamation (GC) | — |
 | T8 | Crash & fault injection | — |

@@ -13,6 +13,7 @@
 // untouched, because the file is append-only and nothing rewrites it in place.
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -80,6 +81,21 @@ class ContainerWriter {
 class ContainerReader {
  public:
   ContainerReader() = default;
+  // std::atomic is not movable, so these are spelled out rather than defaulted.
+  ContainerReader(ContainerReader&& o) noexcept
+      : file_(std::move(o.file_)), header_(o.header_),
+        file_size_(o.file_size_.load(std::memory_order_relaxed)) {}
+  ContainerReader& operator=(ContainerReader&& o) noexcept {
+    if (this != &o) {
+      file_ = std::move(o.file_);
+      header_ = o.header_;
+      file_size_.store(o.file_size_.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+    return *this;
+  }
+  ContainerReader(const ContainerReader&) = delete;
+  ContainerReader& operator=(const ContainerReader&) = delete;
+
   static Result<ContainerReader> open(const std::string& path);
 
   uint32_t id() const { return header_.container_id; }
@@ -100,7 +116,10 @@ class ContainerReader {
  private:
   File file_;
   ContainerHeader header_;
-  uint64_t file_size_ = 0;
+  // Atomic and refreshable: a reader may hold a container open while an ingest
+  // thread is still appending to it, so a bounds check against a stale size
+  // would wrongly report corruption for a record that genuinely exists.
+  std::atomic<uint64_t> file_size_{0};
 };
 
 // Scan a container and truncate any torn tail, leaving a file that is entirely

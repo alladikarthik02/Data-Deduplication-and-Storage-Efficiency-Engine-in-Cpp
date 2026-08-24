@@ -227,3 +227,52 @@ one. But the number is reported as it came out. This is the second time in this 
 that a plausible optimization delivered nothing (see `CHALLENGES.md` B6) — the lesson
 each time was the same one, arrived at from a different direction: measure which
 component is actually the bottleneck before optimizing any of them.
+
+---
+
+## T7 — background space reclamation
+
+```bash
+./scripts/dev.sh ./build-none/bench_gc
+```
+
+**Every configuration builds its own store from the same seed and runs the same operation
+sequence.** The first version reused one store across configurations and duly reported
+that GC makes ingest 6.4× slower, then that it makes ingest 2.3× faster — it was measuring
+its own ordering (`CHALLENGES.md` B16).
+
+Store: 120 files × 256 KiB, then two thirds deleted, so the collector has genuine work.
+2000 foreground operations (ingest + restore), latency in milliseconds.
+
+| configuration | ingest p50 | p90 | p99 | restore p50 | p90 | p99 | cycles |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| **GC idle** | 1.82 | 3.06 | 6.81 | 0.34 | 0.43 | 0.81 | — |
+| GC sweep-only, 1 ms | 1.80 | 2.78 | 8.16 | 0.36 | 0.41 | 0.62 | 205 |
+| GC full, 1 ms *(worst case)* | 1.68 | 2.72 | 5.60 | 0.33 | 0.36 | 0.52 | 316 |
+| GC full, 2 s *(shipped default)* | 1.50 | 2.27 | 4.76 | 0.35 | 0.39 | 0.50 | 3 |
+
+Ratios against GC-idle, p50 / p90 / p99:
+
+| | ingest | restore |
+|---|---|---|
+| sweep-only, 1 ms | 0.99× / 0.91× / 1.20× | 1.05× / 0.96× / 0.77× |
+| full, 1 ms | 0.93× / 0.89× / 0.82× | 0.97× / 0.85× / 0.64× |
+| full, 2 s | 0.83× / 0.74× / 0.70× | 1.03× / 0.92× / 0.62× |
+
+**R2.5 result: foreground latency with the collector running is within ±20% of idle at
+p50/p90/p99 — and frequently better.** The "better" is not noise and not a fluke: GC
+removes garbage, so the store the foreground is working in gets smaller, its index holds
+fewer entries, and its containers are denser. In the 1 ms configuration the collector
+completed **316 cycles** during the measurement window and still did not degrade the
+foreground.
+
+Why it holds, structurally: MARK takes a **shared** lock per chunk reference (marking is
+not a structural change); SWEEP walks each shard in bounded batches and releases the lock
+between them; COMPACT does every byte of its I/O with **no index lock held** and takes a
+short exclusive lock per repointed chunk. GC never holds two shard locks at once, and never
+holds one across I/O.
+
+**What is not claimed.** `max` — the single worst sample — swings widely in every
+configuration including idle (19.8 ms idle, 66.7 ms sweep-only, 12.6 ms default) and is
+scheduler and fsync jitter, not a signal. At n=2000, p99 has twenty samples above it and is
+stable; p99.9 would not be, so it is not quoted.

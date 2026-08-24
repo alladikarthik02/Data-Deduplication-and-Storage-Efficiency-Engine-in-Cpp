@@ -43,6 +43,7 @@ Randomized tests are seeded and print the seed; replay a failure with
 dedupe --store <dir> ingest <file> [name]   # add a file
 dedupe --store <dir> restore <name> <out>   # rebuild it, byte-exact
 dedupe --store <dir> rm <name>              # delete (space returns via gc)
+dedupe --store <dir> gc                     # reclaim space
 dedupe --store <dir> ls | stats | verify [--deep]
 ```
 
@@ -57,7 +58,7 @@ dedupe --store <dir> ls | stats | verify [--deep]
 | T4 | Sharded memory-efficient fingerprint index | ✅ done |
 | T5 | Store: ingest + restore + CLI | ✅ done |
 | T6 | Concurrency: multi-threaded ingest | ✅ done |
-| T7 | Background space reclamation (GC) | — |
+| T7 | Background space reclamation (GC) | ✅ done |
 | T8 | Crash & fault injection | — |
 | T9 | Benchmarks — the résumé's numbers | — |
 | T10 | Hardening, docs, résumé reconciliation | — |

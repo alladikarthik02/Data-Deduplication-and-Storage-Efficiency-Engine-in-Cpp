@@ -170,7 +170,17 @@ Result<std::vector<uint8_t>> ContainerReader::read(uint32_t offset, uint32_t len
   return buf;
 }
 
+Status ContainerReader::refresh_size() {
+  ASSIGN_OR_RETURN(const uint64_t now, file_.size());
+  file_size_.store(now, std::memory_order_release);
+  return Status();
+}
+
 Result<ScanResult> ContainerReader::scan() {
+  // ALWAYS re-stat before scanning. This reader may have been cached since the
+  // container was a 32-byte header, and scanning a stale size makes a full
+  // container look empty (CHALLENGES B15).
+  RETURN_IF_ERROR(refresh_size());
   ScanResult out;
   out.header = header_;
   out.valid_bytes = ContainerHeader::kSize;

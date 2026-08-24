@@ -687,3 +687,170 @@ bugs live: any wrapper that can fail halfway must report how far it got, or its 
 cannot distinguish "nothing happened" from "half of it happened" — and those need opposite
 recovery. That the bug was caught at all is down to a fault-injection test written three
 tasks earlier for an unrelated reason.
+
+---
+
+## B13 ⚔️ The spec's own safety argument had a hole, and the stress test found it
+
+**Symptom.** The first run of the GC stress suite destroyed live data:
+
+```
+restore of live file 't1/f4' failed: not_found: chunk b51b1a91540974f7 not in index
+restore of live file 't2/f1' failed: not_found: chunk 25702c29727322d8 not in index
+```
+
+Files that were never deleted lost chunks. This is an **S2 violation** — the one invariant
+the whole collector design exists to uphold.
+
+**The argument that was wrong.** SPEC §3.6 claimed:
+
+> A recipe published mid-scan may be missed by MARK — but every chunk it references was
+> necessarily touched after the fence, so the epoch clause saves it.
+
+That is true only for ingests that **start** after the fence. An ingest already running
+when the fence is taken stamps its chunks at *lookup* time and publishes the recipe much
+later:
+
+```
+t0  ingest: lookup(C) hits, stamps touch_epoch = 9
+t1  GC:     bump_epoch -> 10        (the fence)
+t2  GC:     mark -- the ingest's recipe does not exist yet, so C is not marked
+t3  ingest: publishes the recipe, which references C
+t4  GC:     sweep -- C is unmarked and touch_epoch(9) < 10  -> ERASED
+```
+
+The gap between stamping a chunk and publishing the recipe that makes it reachable is
+precisely the window the fence was supposed to close, and it did not.
+
+**Fix — a reclaim watermark, not just a fence.** An ingest registers the epoch it began
+in, and GC may only reclaim entries older than the **oldest in-flight ingest**:
+
+```c++
+safe_epoch = min(fence, oldest registered ingest epoch)
+```
+
+GC never *waits* for anyone — it just declines to collect anything an ingest might still
+be counting on. In the trace above, safe_epoch is 9, so `touch_epoch(9) < 9` is false and
+C survives.
+
+**And a sub-race inside the fix.** Registration and the fence must be taken under one
+lock. Otherwise: an ingest reads epoch 9, GC bumps to 10 and sees an empty active set, and
+*only then* does the ingest register — leaving exactly the hole the fix was for. So
+`register_ingest()` and `fence_and_safe_epoch()` share a mutex. The registration is RAII,
+because a leaked one would pin the watermark and stop GC reclaiming anything, forever.
+
+**Generalizes to.** An epoch fence protects operations that *start* after it; it says
+nothing about operations already in flight, and reclamation schemes live or die on that
+distinction. More usefully: the spec contained a written-down safety argument, which is
+what made it possible to find the specific sentence that was false rather than flailing at
+the symptom. An argument you have not written down cannot be shown to be wrong.
+
+---
+
+## B14 🔬 Nine "failures" against a correct engine — the oracle was unfalsifiable
+
+**Symptom.** After B13, the stress test still failed, but differently: no missing chunks
+any more, just `restore of 't1/f0' returned wrong bytes` — nine times.
+
+**Root cause.** My test, not the engine. Writer threads reused eight names each, and the
+oracle was updated *after* the ingest returned:
+
+```c++
+session.ingest_bytes(name, data);           // the store now holds V2
+{ lock; shadow[name] = data; }              // the oracle still says V1
+```
+
+In that window a reader legitimately restores V2 while the oracle claims V1. The guard I
+had written re-checked whether `shadow[name] == want`, which only narrowed the window
+rather than closing it.
+
+**Fix.** Every ingest gets a name of its own, so a live file's bytes cannot legitimately
+change and any mismatch is a real defect. Concurrent overwrite of a single name is already
+covered by T6's `concurrent_publish_of_the_same_name_is_atomic`, where it is the *subject*
+of the test rather than noise in it.
+
+**Generalizes to.** A concurrency oracle has to be exact, or it manufactures failures that
+look exactly like the ones you are hunting — which is worse than no oracle, because it
+sends you looking for engine bugs that are not there. When an oracle cannot be made exact,
+narrow the test until it can.
+
+---
+
+## B15 💾 A stale cached file size made GC delete a container full of live data
+
+**Symptom.** With B13 and B14 fixed, one failure remained, roughly one run in three under
+ASan:
+
+```
+PROBLEM: file 'phoenix0': not_found: open .../containers/c00000000.dat (No such file)
+```
+
+The index pointed at a container that no longer existed.
+
+**How I isolated it.** Rather than theorise further, I printed the location the index was
+handing out:
+
+```
+[read_chunk] fp=6bf0718cd5b4789e -> container=0 offset=32 length=11746
+```
+
+`offset=32` is immediately after a container's 32-byte header — the **first record**. So
+the index entry was entirely legitimate and well-formed; the container had simply been
+deleted underneath it. That ruled out index corruption and pointed straight at GC's
+deletion path.
+
+**Root cause.** `ContainerReader` caches the file size it saw at `open()`. Readers are
+cached and shared across the store, so the reader for container 0 was created during an
+early restore, when the container was still nearly empty. `read()` refreshes that size on
+a bounds miss — but `scan()` did not. So:
+
+1. GC calls `reader(0)` and gets the cached reader, whose `file_size_` is stale.
+2. `scan()` walks only up to that stale size and returns **zero records**.
+3. `live_bytes` is therefore 0, and GC concludes the container holds nothing live.
+4. It deletes a container full of referenced chunks.
+
+A one-line omission — refresh in `read()` but not in `scan()` — turned into total data
+loss for everything in that container. It needed GC *and* cached readers *and* buffered
+writes to exist simultaneously, which is why nothing before T7 could have caught it.
+
+**Fix.** `scan()` re-stats the file first. Plus defence in depth in the collector: a
+container that scans as **empty** is skipped rather than deleted. Deleting is
+irreversible; skipping costs one wasted container until the next cycle. Wrong in the
+direction that costs space, which is the same principle the whole GC design is built on.
+
+**Generalizes to.** Any cached view of mutable external state needs a refresh policy that
+covers **every** reader of that cache, not just the one where the staleness first bit. And
+when a bug's blast radius is "delete everything", add the cheap sanity check that makes the
+catastrophic outcome require two independent failures instead of one.
+
+---
+
+## B16 🔬 The GC latency benchmark measured its own ordering
+
+**Symptom.** The first R2.5 measurement said GC inflated foreground ingest tail latency by
+**6.4× at p99.9**. The second version of the same benchmark said GC made ingest **faster**
+(0.43×). Both cannot be true.
+
+**Root cause.** The configurations ran one after another against the **same store**. The
+"GC idle" phase ran first, on a store deliberately stuffed with garbage; every later phase
+inherited a store the previous phase's collector had already cleaned, and had added its own
+files to. The benchmark was measuring the order of its own cases.
+
+Exactly the same class of mistake as the RSS measurement in B9, and I made it again three
+tasks later — a benchmark whose cases are not independent measures the sequence, not the
+subject.
+
+**Fix.** Each configuration builds its own store from scratch, from the same seed, and
+drives the same operation sequence. Also raised the sample size: at n=400, "p99.9" is the
+second-worst sample and swung between 0.76× and 1.29× across runs. The benchmark now
+reports p50/p90/p99 over n=2000 and does not quote a statistic the sample size cannot
+support.
+
+**With the measurement fixed, the honest answer is good:** foreground ingest and restore
+latency with the collector running is **within ±20% of idle at p50/p90/p99**, and often
+better — collecting garbage shrinks the store the foreground is working in. See
+`BENCHMARKS.md` T7.
+
+**Generalizes to.** Independence is a property of the *harness*, not the subject. If two
+cases can influence each other through shared state, the harness is part of the
+experiment. And a result that flips sign when you change the harness is the harness talking.

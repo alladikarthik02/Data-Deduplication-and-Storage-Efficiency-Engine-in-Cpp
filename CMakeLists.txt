@@ -42,6 +42,8 @@ add_library(dedupe_core STATIC
   src/container.cpp
   src/index.cpp
   src/store.cpp
+  src/gc_journal.cpp
+  src/gc.cpp
 )
 target_link_libraries(dedupe_core PUBLIC pthread)
 
@@ -78,6 +80,10 @@ dedupe_test(test_store)
 # --- T6: concurrency ----------------------------------------------------------
 dedupe_test(test_concurrent)
 
+# --- T7: background space reclamation ----------------------------------------
+dedupe_test(test_gc)
+dedupe_test(test_gc_stress)
+
 # The CLI.
 add_executable(dedupe tools/dedupe_cli.cpp)
 target_link_libraries(dedupe PRIVATE dedupe_core)
@@ -92,3 +98,5 @@ add_executable(bench_index bench/bench_index.cpp)
 target_link_libraries(bench_index PRIVATE dedupe_core)
 add_executable(bench_ingest bench/bench_ingest.cpp)
 target_link_libraries(bench_ingest PRIVATE dedupe_core)
+add_executable(bench_gc bench/bench_gc.cpp)
+target_link_libraries(bench_gc PRIVATE dedupe_core)

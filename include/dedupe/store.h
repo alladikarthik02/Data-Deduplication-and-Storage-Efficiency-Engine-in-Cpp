@@ -25,6 +25,7 @@
 #include <atomic>
 #include <map>
 #include <memory>
+#include <set>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -33,6 +34,7 @@
 #include "dedupe/chunker.h"
 #include "dedupe/container.h"
 #include "dedupe/format.h"
+#include "dedupe/gc_journal.h"
 #include "dedupe/index.h"
 #include "dedupe/io.h"
 #include "dedupe/status.h"
@@ -189,6 +191,44 @@ class Store {
   // the full fingerprint when options().verify_fingerprint_on_read is set.
   Result<std::vector<uint8_t>> read_chunk(const Digest32& fp);
 
+  // --- surface used by Gc (SPEC 3.6) ---------------------------------------
+  // Every container currently on disk, sorted.
+  Result<std::vector<uint32_t>> container_ids();
+  // True while an IngestSession still owns this container. GC never compacts
+  // one: its length is still moving, and its owner would keep appending into a
+  // file that is about to be unlinked.
+  bool container_is_open(uint32_t id);
+  // A destination container for compaction. Not registered as an open slot --
+  // GC syncs and closes it itself before anything is repointed at it.
+  Result<ContainerWriter> create_container_for_gc();
+  Result<std::shared_ptr<ContainerReader>> reader(uint32_t id) { return reader_for(id); }
+  // Drop the reader and unlink the file. Any reader still holding the shared_ptr
+  // keeps reading through its open fd -- POSIX keeps an unlinked file alive
+  // until the last descriptor closes, which is what makes this safe to do while
+  // restores are in flight (S2).
+  Status retire_container(uint32_t id);
+  GcJournal& journal() { return journal_; }
+
+  // --- in-flight ingest registration (the S2 fix, CHALLENGES B13) -----------
+  //
+  // An ingest stamps a chunk's touch_epoch when it LOOKS IT UP, but the recipe
+  // that makes the chunk reachable is not published until much later. A GC fence
+  // taken in between sees a chunk that is neither marked (no recipe yet) nor
+  // recent (stamped before the fence) and frees it out from under an ingest
+  // that is still running.
+  //
+  // So an ingest registers the epoch it began in, and GC may only reclaim
+  // entries older than the OLDEST in-flight ingest. GC never waits for anyone;
+  // it just declines to collect anything an ingest might still be counting on.
+  uint32_t register_ingest();
+  void unregister_ingest(uint32_t epoch);
+  // Advances the epoch and returns the reclaim watermark, atomically with
+  // respect to register_ingest(). Doing these separately leaves a sub-race: an
+  // ingest can read the old epoch, GC can fence and see an empty active set, and
+  // only then does the ingest register.
+  uint32_t fence_and_safe_epoch(uint32_t* out_fence);
+  std::string gc_journal_path() const { return path_join(path_, "gc-journal"); }
+
  private:
   friend class IngestSession;
   Store() = default;
@@ -226,6 +266,14 @@ class Store {
   std::shared_mutex slots_mu_;
   std::map<uint32_t, std::shared_ptr<ContainerSlot>> slots_;
 
+  Status replay_gc_journal();
+
+  // Guards the active-ingest multiset AND the epoch fence, so the two cannot
+  // interleave. A multiset because several ingests can share a start epoch.
+  std::mutex active_mu_;
+  std::multiset<uint32_t> active_ingests_;
+
+  GcJournal journal_;
   std::atomic<uint64_t> physical_bytes_{0};
   std::atomic<uint64_t> forced_syncs_{0};
 };

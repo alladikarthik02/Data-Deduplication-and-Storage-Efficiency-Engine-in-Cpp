@@ -183,7 +183,7 @@ Result<InsertResult> Index::insert(const Digest32& fp, Location loc) {
   e.k0 = k0;
   e.k1 = k1;
   e.loc = loc.pack();
-  e.flags = Entry::kOccupied;
+  e.flags.store(Entry::kOccupied, std::memory_order_relaxed);
   e.touch_epoch.store(epoch(), std::memory_order_relaxed);
   insert_unlocked(s, e);
 
@@ -209,6 +209,50 @@ bool Index::erase(const Digest32& fp) {
   Shard& s = shards_[shard_of(fp)];
   uint64_t k0, k1;
   key_of(fp, &k0, &k1);
+  std::unique_lock<std::shared_mutex> lk(s.mu);
+  size_t idx = 0;
+  if (!find_slot(s, k0, k1, &idx)) return false;
+  erase_at(s, idx);
+  return true;
+}
+
+bool Index::peek(const Digest32& fp, Location* out) const {
+  const Shard& s = shards_[shard_of(fp)];
+  uint64_t k0, k1;
+  key_of(fp, &k0, &k1);
+  std::shared_lock<std::shared_mutex> lk(s.mu);
+  size_t idx = 0;
+  if (!find_slot(s, k0, k1, &idx)) return false;
+  if (out != nullptr) *out = Location::unpack(s.slots[idx].loc);
+  return true;
+}
+
+bool Index::mark(const Digest32& fp, uint32_t mark_epoch) {
+  Shard& s = shards_[shard_of(fp)];
+  uint64_t k0, k1;
+  key_of(fp, &k0, &k1);
+  std::shared_lock<std::shared_mutex> lk(s.mu);
+  size_t idx = 0;
+  if (!find_slot(s, k0, k1, &idx)) return false;
+  s.slots[idx].set_mark_epoch(mark_epoch);
+  return true;
+}
+
+bool Index::repoint_if(const Digest32& fp, Location expect, Location to) {
+  if (!to.fits()) return false;
+  Shard& s = shards_[shard_of(fp)];
+  uint64_t k0, k1;
+  key_of(fp, &k0, &k1);
+  std::unique_lock<std::shared_mutex> lk(s.mu);
+  size_t idx = 0;
+  if (!find_slot(s, k0, k1, &idx)) return false;
+  if (s.slots[idx].loc != expect.pack()) return false;  // someone moved it first
+  s.slots[idx].loc = to.pack();
+  return true;
+}
+
+bool Index::erase_key(uint64_t k0, uint64_t k1) {
+  Shard& s = shards_[static_cast<size_t>(k0 & 0xFF)];
   std::unique_lock<std::shared_mutex> lk(s.mu);
   size_t idx = 0;
   if (!find_slot(s, k0, k1, &idx)) return false;

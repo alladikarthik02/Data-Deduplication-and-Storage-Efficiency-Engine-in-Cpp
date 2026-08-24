@@ -8,6 +8,7 @@
 #include <random>
 
 #include "dedupe/crc32c.h"
+#include "dedupe/gc_journal.h"
 #include "dedupe/sha256.h"
 
 namespace dedupe {
@@ -147,6 +148,11 @@ Result<std::unique_ptr<Store>> Store::open(const std::string& path, StoreOptions
     RETURN_IF_ERROR(store->write_superblock());
   }
 
+  // BEFORE the index is built: finish or undo whatever a crash interrupted, so
+  // the index is never built over a container that is about to be unlinked.
+  RETURN_IF_ERROR(store->replay_gc_journal());
+  ASSIGN_OR_RETURN(store->journal_, GcJournal::open(store->gc_journal_path()));
+
   RETURN_IF_ERROR(store->rebuild_index());
   return store;
 }
@@ -163,6 +169,123 @@ Store::~Store() {
     (void)slot->writer.close();
     slot->open.store(false, std::memory_order_relaxed);
   }
+}
+
+// Replay the GC intent log (SPEC 3.6). Both branches are idempotent, so a crash
+// during recovery is just another crash to recover from.
+Status Store::replay_gc_journal() {
+  ASSIGN_OR_RETURN(std::vector<GcJournalRecord> records,
+                   GcJournal::read_all(gc_journal_path()));
+  if (records.empty()) return Status();
+
+  struct Pending {
+    uint32_t src = 0;
+    bool committed = false;
+    bool done = false;
+    bool delete_only = false;
+  };
+  std::map<uint32_t, Pending> by_dst;  // keyed by dst, or by src for DELETE
+  for (const GcJournalRecord& r : records) {
+    switch (r.op) {
+      case GcOp::kBeginCompact: by_dst[r.dst] = Pending{r.src, false, false, false}; break;
+      case GcOp::kCommit: by_dst[r.dst].committed = true; by_dst[r.dst].src = r.src; break;
+      case GcOp::kDone: by_dst[r.dst].done = true; break;
+      case GcOp::kDeleteContainer:
+        by_dst[r.src] = Pending{r.src, true, false, true};
+        break;
+    }
+  }
+
+  size_t undone = 0, finished = 0;
+  for (const auto& [dst, p] : by_dst) {
+    if (p.done) continue;
+    if (p.delete_only) {
+      // The container had no live chunks. Removing it again is harmless.
+      const Status st = unlink_file(container_path(p.src));
+      if (!st.ok() && st.code() != Err::kNotFound) return st;
+      finished++;
+    } else if (p.committed) {
+      // dst is complete and durable, so src is redundant -- finish the job.
+      const Status st = unlink_file(container_path(p.src));
+      if (!st.ok() && st.code() != Err::kNotFound) return st;
+      finished++;
+    } else {
+      // We never committed, so dst is an incomplete copy and src is untouched.
+      // Throw the copy away.
+      const Status st = unlink_file(container_path(dst));
+      if (!st.ok() && st.code() != Err::kNotFound) return st;
+      undone++;
+    }
+  }
+  if (undone > 0 || finished > 0) {
+    std::fprintf(stderr, "dedupe: gc recovery -- %zu compaction(s) finished, %zu undone\n",
+                 finished, undone);
+  }
+  // Nothing is in flight any more.
+  ASSIGN_OR_RETURN(GcJournal j, GcJournal::open(gc_journal_path()));
+  return j.reset();
+}
+
+uint32_t Store::register_ingest() {
+  std::lock_guard<std::mutex> lk(active_mu_);
+  const uint32_t e = index_.epoch();
+  active_ingests_.insert(e);
+  return e;
+}
+
+void Store::unregister_ingest(uint32_t epoch) {
+  std::lock_guard<std::mutex> lk(active_mu_);
+  auto it = active_ingests_.find(epoch);
+  if (it != active_ingests_.end()) active_ingests_.erase(it);
+}
+
+uint32_t Store::fence_and_safe_epoch(uint32_t* out_fence) {
+  std::lock_guard<std::mutex> lk(active_mu_);
+  const uint32_t fence = index_.bump_epoch();
+  if (out_fence != nullptr) *out_fence = fence;
+  // Nothing in flight: the fence itself is the watermark. Otherwise hold back to
+  // the oldest ingest still running -- anything it looked up before the fence is
+  // still fair game for a recipe it has not published yet.
+  if (active_ingests_.empty()) return fence;
+  return std::min(fence, *active_ingests_.begin());
+}
+
+Result<std::vector<uint32_t>> Store::container_ids() {
+  ASSIGN_OR_RETURN(std::vector<std::string> names, list_dir(containers_dir()));
+  std::vector<uint32_t> ids;
+  for (const std::string& n : names) {
+    if (n.size() != 13 || n[0] != 'c' || n.compare(9, 4, ".dat") != 0) continue;
+    ids.push_back(static_cast<uint32_t>(std::strtoul(n.substr(1, 8).c_str(), nullptr, 10)));
+  }
+  std::sort(ids.begin(), ids.end());
+  return ids;
+}
+
+bool Store::container_is_open(uint32_t id) {
+  auto slot = find_slot(id);
+  return slot != nullptr && slot->open.load(std::memory_order_acquire);
+}
+
+Result<ContainerWriter> Store::create_container_for_gc() {
+  const uint32_t id = next_container_id_.fetch_add(1, std::memory_order_relaxed);
+  if (id > Location::kMaxContainer) {
+    return Status::error(Err::kNoSpace, "store is full: container id overflow");
+  }
+  return ContainerWriter::create(container_path(id), id, uuid_);
+}
+
+Status Store::retire_container(uint32_t id) {
+  {
+    std::unique_lock<std::shared_mutex> lk(readers_mu_);
+    readers_.erase(id);  // any shared_ptr already handed out keeps its fd alive
+  }
+  {
+    std::unique_lock<std::shared_mutex> lk(slots_mu_);
+    slots_.erase(id);
+  }
+  const Status st = unlink_file(container_path(id));
+  if (!st.ok() && st.code() != Err::kNotFound) return st;
+  return Status();
 }
 
 Result<std::shared_ptr<ContainerSlot>> Store::new_container() {
@@ -315,9 +438,23 @@ Result<Location> IngestSession::write_chunk(const Digest32& fp, ByteSpan payload
   return loc;
 }
 
+namespace {
+// RAII: a leaked registration would pin GC's reclaim watermark forever, so this
+// must survive every early return and error path in the ingest routines.
+struct IngestRegistration {
+  Store* store;
+  uint32_t epoch;
+  explicit IngestRegistration(Store* s) : store(s), epoch(s->register_ingest()) {}
+  ~IngestRegistration() { store->unregister_ingest(epoch); }
+  IngestRegistration(const IngestRegistration&) = delete;
+  IngestRegistration& operator=(const IngestRegistration&) = delete;
+};
+}  // namespace
+
 Result<IngestStats> IngestSession::ingest_bytes(const std::string& name, ByteSpan data) {
   if (name.empty()) return Status::invalid("ingest: empty name");
   if (store_ == nullptr) return Status::invalid("ingest: session is finished");
+  IngestRegistration reg(store_);
 
   IngestStats stats;
   Recipe recipe;
@@ -395,6 +532,7 @@ Result<IngestStats> IngestSession::ingest_bytes(const std::string& name, ByteSpa
 Result<IngestStats> IngestSession::ingest_file(const std::string& name,
                                                const std::string& source_path) {
   if (store_ == nullptr) return Status::invalid("ingest: session is finished");
+  IngestRegistration reg(store_);
   // S12: opened read-only. Ingest never modifies the user's source data.
   ASSIGN_OR_RETURN(File in, File::open(source_path, O_RDONLY));
 
@@ -489,17 +627,38 @@ Result<IngestStats> Store::ingest_file(const std::string& name, const std::strin
 }
 
 Result<std::vector<uint8_t>> Store::read_chunk(const Digest32& fp) {
-  Location loc;
-  if (!index_.lookup(fp, &loc)) {
-    return Status::error(Err::kNotFound, "chunk " + to_hex(fp).substr(0, 16) + " not in index");
+  // Two attempts, because GC's copy-forward compaction can move a chunk between
+  // our index lookup and our read: we would then hold a location whose container
+  // has just been unlinked. Re-consulting the index gives the new location. The
+  // window is small but it is real, and the alternative -- pinning every
+  // container a reader might ever consult -- would defeat compaction entirely.
+  Status last;
+  for (int attempt = 0; attempt < 2; attempt++) {
+    Location loc;
+    if (!index_.lookup(fp, &loc)) {
+      return Status::error(Err::kNotFound, "chunk " + to_hex(fp).substr(0, 16) + " not in index");
+    }
+    // The record may still be in an open writer's buffer, invisible to a reader.
+    // Flushing is enough here -- durability is the publish path's problem.
+    const uint64_t end = static_cast<uint64_t>(loc.offset) + ChunkHeader::kSize + loc.length;
+    RETURN_IF_ERROR(ensure_visible(loc.container_id, end));
+    auto reader = reader_for(loc.container_id);
+    if (reader.ok()) {
+      auto data = reader.value()->read(loc.offset, loc.length,
+                                       opts_.verify_fingerprint_on_read ? &fp : nullptr);
+      if (data.ok()) return data;
+      last = data.status();
+    } else {
+      last = reader.status();
+#ifdef DEDUPE_DEBUG_READ
+      std::fprintf(stderr,
+                   "[read_chunk] fp=%s -> container=%u offset=%u length=%u : %s\n",
+                   to_hex(fp).substr(0, 16).c_str(), loc.container_id, loc.offset, loc.length,
+                   reader.status().message().c_str());
+#endif
+    }
   }
-  // The record may still be sitting in an open writer's buffer, invisible to a
-  // reader. Flushing is enough here -- durability is the publish path's problem,
-  // readability is this one's.
-  const uint64_t end = static_cast<uint64_t>(loc.offset) + ChunkHeader::kSize + loc.length;
-  RETURN_IF_ERROR(ensure_visible(loc.container_id, end));
-  ASSIGN_OR_RETURN(std::shared_ptr<ContainerReader> reader, reader_for(loc.container_id));
-  return reader->read(loc.offset, loc.length, opts_.verify_fingerprint_on_read ? &fp : nullptr);
+  return last;
 }
 
 Result<Recipe> Store::read_recipe(const std::string& name) {

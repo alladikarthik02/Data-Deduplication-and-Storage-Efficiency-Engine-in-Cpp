@@ -131,7 +131,17 @@ class ContainerReader {
 
   // Walk every record from the start. This is both the recovery path and the
   // index-rebuild path.
+  //
+  // Refreshes the cached file size first. That is not a nicety: readers are
+  // cached and shared, so a reader opened while a container was nearly empty
+  // would otherwise scan only the prefix it saw at open time -- and GC, seeing
+  // no records, would conclude the container held nothing live and delete it.
+  // See CHALLENGES B15.
   Result<ScanResult> scan();
+
+  // Re-stat the file. Cheap, and the only defence against a cached size that a
+  // concurrent appender has outgrown.
+  Status refresh_size();
 
  private:
   File file_;

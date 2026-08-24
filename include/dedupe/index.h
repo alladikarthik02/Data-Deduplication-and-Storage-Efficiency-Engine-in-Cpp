@@ -95,26 +95,39 @@ struct Entry {
   // hit path take an exclusive lock instead would put GC's whole reason for
   // existing (not blocking the foreground) back on the table.
   std::atomic<uint32_t> touch_epoch{0};
-  uint32_t flags = 0;
+  // bit 0 = occupied, bits 1..31 = the GC epoch in which this entry was last
+  // MARKED as reachable from a recipe. Packing the mark into the existing flags
+  // word keeps the entry at 32 bytes; a separate field would have pushed it to
+  // 40 and cost 25% more RAM for one bit of information per cycle.
+  //
+  // Atomic because GC marks under a SHARED lock: marking is not a structural
+  // change, and taking the exclusive lock once per chunk reference would make
+  // the mark phase stall every ingest thread -- exactly what S7 forbids.
+  std::atomic<uint32_t> flags{0};
 
   static constexpr uint32_t kOccupied = 1u;
 
   Entry() = default;
   Entry(const Entry& o)
       : k0(o.k0), k1(o.k1), loc(o.loc),
-        touch_epoch(o.touch_epoch.load(std::memory_order_relaxed)), flags(o.flags) {}
+        touch_epoch(o.touch_epoch.load(std::memory_order_relaxed)),
+        flags(o.flags.load(std::memory_order_relaxed)) {}
   Entry& operator=(const Entry& o) {
     k0 = o.k0;
     k1 = o.k1;
     loc = o.loc;
     touch_epoch.store(o.touch_epoch.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    flags = o.flags;
+    flags.store(o.flags.load(std::memory_order_relaxed), std::memory_order_relaxed);
     return *this;
   }
-  bool occupied() const { return (flags & kOccupied) != 0; }
+  bool occupied() const { return (flags.load(std::memory_order_relaxed) & kOccupied) != 0; }
+  uint32_t mark_epoch() const { return flags.load(std::memory_order_relaxed) >> 1; }
+  void set_mark_epoch(uint32_t e) {
+    flags.store(kOccupied | ((e & 0x7FFFFFFFu) << 1), std::memory_order_relaxed);
+  }
   void clear() {
     k0 = k1 = loc = 0;
-    flags = 0;
+    flags.store(0, std::memory_order_relaxed);
     touch_epoch.store(0, std::memory_order_relaxed);
   }
 };
@@ -163,7 +176,24 @@ class Index {
   // compaction step, and it must not create an entry if one is absent.
   bool repoint(const Digest32& fp, Location loc);
 
+  // Like lookup(), but does NOT stamp touch_epoch. GC must use this: a scanning
+  // pass that touched every entry it looked at would mark the whole store as
+  // hot and reclaim nothing, forever.
+  bool peek(const Digest32& fp, Location* out) const;
+
+  // Mark an entry as reachable in `mark_epoch`. Shared lock; no touch stamp.
+  bool mark(const Digest32& fp, uint32_t mark_epoch);
+
+  // Conditional repoint for GC's copy-forward: move the entry only if it still
+  // points where we think it does. A concurrent ingest may have already
+  // repointed it, and clobbering that would strand the newer copy.
+  bool repoint_if(const Digest32& fp, Location expect, Location to);
+
   bool erase(const Digest32& fp);
+  // Erase by truncated key. GC's sweep works from index entries, which hold only
+  // the 128-bit key -- and that is enough, since the shard is the low byte of k0
+  // (fingerprint byte 0) and the probe hash is k1.
+  bool erase_key(uint64_t k0, uint64_t k1);
   bool contains(const Digest32& fp);
 
   size_t size() const;

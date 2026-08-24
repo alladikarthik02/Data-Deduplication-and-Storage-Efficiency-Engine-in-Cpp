@@ -466,3 +466,120 @@ the single point is usually a boundary your model smoothed over — check whethe
 right before "fixing" it. Sweeping every offset instead of three hand-picked ones is what
 surfaced it; a test with three cases would have missed this and left me believing a
 falsehood about my own format.
+
+---
+
+## B9 🔬 The memory benchmark reported a 1M-entry hash map costing 11 MiB
+
+**Symptom.** The first run of `bench_index`, comparing our index against two
+`std::unordered_map` baselines:
+
+```
+  dedupe::Index (sharded, flat)            68.6 MiB    72.0 B/entry
+  unordered_map<string,Location>          133.0 MiB   139.4 B/entry
+  unordered_map<Digest32,Location>         11.0 MiB    11.6 B/entry   <-- ???
+```
+
+11.6 bytes per entry for a node-based hash map whose *key alone* is 32 bytes. And the
+scaling table underneath reported 0.0 MiB at every size.
+
+**Hypotheses.**
+- (H1) `unordered_map<Digest32, ...>` is secretly brilliant. — Rejected on arithmetic, not
+  taste: a node holds a 32-byte key, a 12-byte value and a next pointer. 11.6 bytes is
+  below the key. No implementation makes that possible.
+- (H2) The RSS reader is broken. — Checked: the *first* case reported 68.6 MiB, which is
+  the right order of magnitude, so the reader works.
+- (H3) The measurement METHOD is broken for every case after the first. — Correct.
+
+**How I isolated it.** The clue is which cases were wrong: the first was plausible, all
+later ones were near zero. That pattern rules out the reader and points at the baseline
+each case measures against.
+
+**Root cause.** I measured RSS before and after building each structure, all in one
+process. When the previous structure is freed, glibc does **not** return those pages to
+the kernel — it keeps them on its own free lists. So case 2 allocated into memory that was
+already resident, RSS did not move, and the delta was ~0. **An RSS delta is only
+meaningful for the first large allocation in a process.**
+
+**Fix.** Run every case in its own `fork()`ed child. Each child inherits a small baseline,
+builds exactly one structure, prints its row and `_exit`s.
+
+That immediately exposed a second, smaller bug: the header line was reprinted for every
+case, because `fork()` duplicates the parent's *buffered* stdout and each child then
+flushes its own copy. One `fflush(stdout)` before the fork.
+
+**What the honest numbers turned out to be.** `unordered_map<Digest32,Location>` costs
+**92.7 B/entry**, not 11.6 — and our index at that moment cost 72.9. So the real finding
+underneath the measurement bug was that **our "memory-efficient" index was barely more
+efficient than the baseline it was supposed to beat**, which is what led directly to B10.
+
+**Generalizes to.** A measurement that flatters you is worth more scrutiny than one that
+does not. The 11 MiB was arithmetically impossible, and noticing *that* — rather than
+accepting a favourable-looking table — was the whole diagnosis. Also: process-level
+metrics like RSS are not composable within a process; isolate them or use a different
+instrument.
+
+---
+
+## B10 🔬 The index was 72.9 B/entry against a theoretical 35.6 — doubling was the culprit
+
+**Symptom.** With the measurement fixed, the actual numbers were bad:
+
+```
+dedupe::Index      72.9 B/entry   (load 0.477, max probe 33)
+unordered_map      92.7 B/entry
+```
+
+A 32-byte entry at the design's 0.75 load factor should cost 42.7 B/entry. We were at
+72.9 — and only **1.27× better** than the baseline the résumé bullet claims to beat. The
+spec's memory-efficiency claim was, at that moment, not true.
+
+**Hypotheses.**
+- (H1) The entry grew past 32 bytes through padding. — Rejected instantly: `static_assert`
+  in `index.h` and a T0 test both pin it at 32.
+- (H2) Shards are unevenly loaded, so some are oversized. — Rejected by measurement: 100k
+  keys over 256 shards gave min 330 / max 455 against an expected 390. Healthy.
+- (H3) The **achieved** load factor is far below the maximum. — Confirmed by the report
+  itself: load 0.477, not 0.75.
+
+**Root cause — two compounding mistakes.**
+
+*First:* a table that doubles spends its life oscillating between `max/2` and `max` load.
+The 0.75 ceiling is the value at the instant before a resize; the average is ~0.56, and
+immediately after a resize it is 0.375. I had quoted the ceiling in the spec as though it
+were the operating point.
+
+*Second, and the part I had assumed away:* I expected 256 independent shards to smooth
+this out — some full, some just resized. They do not. Uniform hashing means every shard
+holds within a few percent of the same count, so **all 256 cross their threshold at almost
+the same moment**. The aggregate load factor sawtooths just as hard as a single table
+would. Sharding buys concurrency and bounded rehash *stalls*; it buys nothing at all for
+average occupancy, and I had quietly credited it with both.
+
+**Fix — two changes, each measured.**
+
+1. **Robin Hood probing.** Entries are kept ordered by displacement, so a lookup stops as
+   soon as it meets an entry closer to its home than the probe has travelled. Unsuccessful
+   lookups — the common case, since every new chunk misses — drop from ~`1/(1-α)²` probes
+   to ~`1/(1-α)`, and the displacement *variance* collapses. That makes a 0.90 load factor
+   safe where 0.75 previously was not.
+2. **Growth factor 1.5 instead of 2.**  The load band narrows from `[0.45, 0.90]` to
+   `[0.60, 0.90]`, taking the average from ~0.68 to ~0.74. The cost is that capacity is no
+   longer a power of two, so the home slot is computed with Lemire's fastrange (a 64×64
+   multiply keeping the high half) instead of a mask — which also consumes the *high* bits
+   of the key, strictly better distributed than the low bits a mask takes.
+
+| | before | after |
+|---|---:|---:|
+| achieved load factor | 0.477 | **0.706** |
+| bytes per entry (RSS, 1M entries) | 72.9 | **51.5** |
+| max probe distance | 33 (80 at 200k) | **19** |
+| vs tuned `unordered_map` | 1.27× | **1.80×** |
+
+**Generalizes to.** A ceiling is not an operating point — for anything that grows
+geometrically, the average sits well below the maximum, and quoting the maximum is a way
+of being wrong on purpose. And the more useful lesson: I had assumed sharding would smooth
+the aggregate load, never checked it, and built a memory claim on top. The assumption was
+load-bearing and invisible until something forced a measurement. The measurement is now a
+test (`CHECK_GE(load_factor, 0.55)`), so a future change that reintroduces doubling fails
+in CI instead of quietly costing 40% more RAM.

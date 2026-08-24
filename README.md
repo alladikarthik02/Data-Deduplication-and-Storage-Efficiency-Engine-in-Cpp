@@ -41,7 +41,7 @@ Randomized tests are seeded and print the seed; replay a failure with
 | T1 | SHA-256 + CRC32C fingerprinting, runtime-dispatched hardware backends | ✅ done |
 | T2 | FastCDC content-defined chunker | ✅ done |
 | T3 | On-disk formats + checked/injectable I/O layer | ✅ done |
-| T4 | Sharded memory-efficient fingerprint index | — |
+| T4 | Sharded memory-efficient fingerprint index | ✅ done |
 | T5 | Store: ingest + restore + CLI | — |
 | T6 | Concurrency: multi-threaded ingest | — |
 | T7 | Background space reclamation (GC) | — |

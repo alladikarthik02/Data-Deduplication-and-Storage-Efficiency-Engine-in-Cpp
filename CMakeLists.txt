@@ -40,6 +40,7 @@ add_library(dedupe_core STATIC
   src/io.cpp
   src/format.cpp
   src/container.cpp
+  src/index.cpp
 )
 target_link_libraries(dedupe_core PUBLIC pthread)
 
@@ -67,9 +68,14 @@ dedupe_test(test_io)
 dedupe_test(test_format)
 dedupe_test(test_container)
 
+# --- T4: the fingerprint index -----------------------------------------------
+dedupe_test(test_index)
+
 # Benchmarks are built, not run, by ctest -- they are measurements, not pass/fail
 # gates. Run them explicitly:  ./build-none/bench_hash
 add_executable(bench_hash bench/bench_hash.cpp)
 target_link_libraries(bench_hash PRIVATE dedupe_core)
 add_executable(bench_chunker bench/bench_chunker.cpp)
 target_link_libraries(bench_chunker PRIVATE dedupe_core)
+add_executable(bench_index bench/bench_index.cpp)
+target_link_libraries(bench_index PRIVATE dedupe_core)

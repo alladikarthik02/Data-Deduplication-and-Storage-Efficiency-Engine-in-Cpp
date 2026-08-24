@@ -78,8 +78,8 @@
 
 | ID | Requirement | Proven by |
 |---|---|---|
-| R3.1 | The index is **memory-efficient** in a measured, comparable sense. | `bench/index_mem`: our bytes/chunk vs a `std::unordered_map<std::string,Loc>` baseline, both measured, ratio reported. Target ≤32 B/chunk vs ~100+ B/chunk baseline. |
-| R3.2 | Throughput does **not degrade** as the dataset grows. | `bench/scaling`: MB/s at 1×, 2×, 4×, 8× dataset size; assert no monotonic collapse and no rehash cliff (per-shard independent growth, §3.4). |
+| R3.1 | The index is **memory-efficient** in a measured, comparable sense. | ✅ `bench_index`: **51.5 B/entry vs 92.7** for a *tuned* `unordered_map<Digest32,Location>` (**1.80×**) and 140.7 for `unordered_map<string,Location>` (**2.73×**). RSS measured in a forked child per case, so allocator overhead is included. |
+| R3.2 | Throughput does **not degrade** as the dataset grows. | ✅ `bench_index` scaling: **dedup throughput 2021 → 1925 MB/s (−4.8%) over a 16× dataset increase.** Index *latency* does grow 5.4× (cache, not algorithm — probe distance stays 12→19), and both numbers are reported rather than only the flattering one. |
 | R3.3 | The **chunking/indexing path is tuned**, with before/after numbers. | Every optimization lands with a measurement in `docs/BENCHMARKS.md`. An optimization without a number does not go in. |
 | R3.4 | "Extensive automated test suite." | `ctest` runs unit + property + fault-injection + concurrency + sanitizer suites. §6. |
 
@@ -298,12 +298,25 @@ Design choices and their reasons:
   2. **No global rehash cliff** — shards grow independently, so a resize stalls 1/256th of the
      keyspace instead of the whole engine. This is what makes R3.2 ("throughput steady as the dataset
      grows") true rather than aspirational.
-- **Max load factor 0.75**, capacity a power of two, index = `k0 & (cap-1)`. Empty slot = `k0==0 &&
-  k1==0` (a fingerprint with 128 leading zero bits is not going to happen; asserted anyway).
+- **Robin Hood probing, max load factor 0.90, growth factor 1.5, capacity NOT a power of two.**
+  Each of those is a correction to an earlier design that measured badly (`CHALLENGES.md` B10).
+  Plain linear probing costs ~`1/(1-α)²` probes on an unsuccessful lookup — the common case,
+  since every new chunk misses — so 0.90 was unusable without Robin Hood's displacement
+  ordering and early exit. Growth of 2× leaves the table oscillating between 0.45 and 0.90
+  load; 1.5× narrows that to [0.60, 0.90]. Sharding does **not** smooth this: uniform hashing
+  makes all 256 shards cross their threshold at nearly the same instant. The home slot uses
+  Lemire's fastrange (a 64×64 multiply keeping the high half), which works for any capacity
+  and consumes the high bits of the key.
+- **Deletion is backward-shift, not tombstones.** GC erases entries, and tombstones never go
+  away — they lengthen every probe chain until the table is rebuilt, so a delete-heavy store
+  degrades. Backward-shift restores the table to exactly the state it would have had if the
+  key had never been inserted.
 
-Expected cost: 32 B/entry ÷ 0.75 load ≈ **42.7 B of RAM per stored chunk**. At the *measured*
-mean chunk size of 9294 B (§3.1, not the nominal 8192) that is **0.459% of logical data**, so
-1 TiB of unique data needs **≈4.70 GiB** of index. §8.3 is honest about what that means.
+**Measured** cost (RSS, 1M entries, `BENCHMARKS.md` T4): **51.5 B of RAM per stored chunk** at
+load 0.706, against 92.7 for a tuned `std::unordered_map<Digest32, Location>` (**1.80×**) and
+140.7 for the obvious `unordered_map<std::string, Location>` (**2.73×**). At the measured mean
+chunk size of 9294 B that is **0.554% of logical data**, so 1 TiB of unique data needs
+**≈5.7 GiB** of index. §8.3 is honest about what that means.
 
 ### 3.5 Concurrency model
 

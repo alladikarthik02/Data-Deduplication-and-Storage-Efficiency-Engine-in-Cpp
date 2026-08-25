@@ -318,3 +318,88 @@ total unavailability from a file that provably held nothing (`CHALLENGES.md` B17
 to `write()` are in the kernel's page cache and survive. This is **process-crash
 consistency**, not power-loss durability — SPEC §8.6 says the same, and conflating the two
 is the standard way a storage project overclaims.
+
+---
+
+## T9 — storage reduction on a defined backup workload (R1.4)
+
+```bash
+./scripts/dev.sh ./build-none/bench_corpus
+```
+
+**A dedup ratio is a property of the data, not the engine.** Ten full backups of a
+slowly-changing tree dedup ~8×; ten tarballs of unrelated random bytes dedup 1.0×. Quoting
+a bare number is the most common way storage benchmarks lie, so the number below always
+travels with its generator, and is bounded on both sides by controls.
+
+**Corpus.** 2000 files, size mix 60% 1–17 KiB / 30% 16–256 KiB / 9% 0.25–2.3 MiB / 1% 2–8 MiB.
+The small-file bias is deliberate: a file under the 2 KiB minimum chunk size is a single
+chunk and dedups only if bit-identical, so an all-large-files corpus would flatter the
+result. **Chunk payloads are not compressed** (SPEC §1), so every byte of the reduction is
+attributable to deduplication.
+
+**Workload.** 8 successive full backups; between generations 3% of files are modified
+(in-place edit, append, or truncate), 1% created, 1% deleted.
+
+| generation | files | logical | physical | ratio |
+|---:|---:|---:|---:|---:|
+| 1 | 2000 | 467.3 MiB | 469.7 MiB | 0.99× |
+| 2 | 2000 | 936.3 MiB | 474.2 MiB | 1.97× |
+| 3 | 2000 | 1405.2 MiB | 479.6 MiB | 2.93× |
+| 4 | 2000 | 1876.5 MiB | 483.2 MiB | 3.88× |
+| 5 | 2000 | 2346.5 MiB | 488.8 MiB | 4.80× |
+| 6 | 2000 | 2816.3 MiB | 495.3 MiB | 5.69× |
+| 7 | 2000 | 3295.7 MiB | 509.4 MiB | 6.47× |
+| **8** | **2000** | **3766.3 MiB** | **511.4 MiB** | **7.36×** |
+
+Alongside it: 16 000 file ingests, 58 312 unique chunks, index **2.3 MiB = 41.2 B/chunk**
+(T4's structural prediction was ~42.7 B/entry — this is the same number measured on real
+data), **0.061% of logical size**. End to end 29.9 s, 126.1 MB/s — far below the 893 MB/s
+of `bench_ingest` because each of those 16 000 files gets its own durable publish, and
+per-file fsync cost dominates when files are small.
+
+### Controls — the number is bounded on both sides
+
+| control | result | expected |
+|---|---:|---|
+| every generation entirely **unique** random data | **0.99×** | ~1.0× — anything higher would mean the engine is finding duplication that does not exist |
+| a **single** generation, no repeat backups | **0.99×** | ~1.0× — what one backup dedups against itself |
+
+Both land just *under* 1.0×, and that is correct rather than disappointing: the 48-byte
+record header on every ~9.3 KiB chunk is ~0.5% overhead, so a corpus with no duplication
+costs slightly more than it started as. An engine reporting 1.05× on unique random data
+would be one to distrust.
+
+### Sensitivity — the headline is a point on a curve, not a lucky configuration
+
+8 generations, 1000 files:
+
+| churn per generation | logical | physical | ratio |
+|---:|---:|---:|---:|
+| 1% | 1529.3 MiB | 214.3 MiB | 7.14× |
+| 3% | 1516.6 MiB | 200.6 MiB | 7.56× |
+| 10% | 1509.1 MiB | 210.5 MiB | 7.17× |
+| 25% | 1580.8 MiB | 231.2 MiB | 6.84× |
+
+| generations (3% churn) | 1 | 2 | 4 | 6 | 8 | 12 |
+|---|---:|---:|---:|---:|---:|---:|
+| ratio | 0.99× | 1.96× | 3.86× | 5.61× | 7.45× | 10.69× |
+
+**The interesting result is which knob matters.** Going from 1% to 25% churn — a 25×
+increase in how much changes between backups — moves the ratio by only 7.14× → 6.84×.
+Going from 4 generations to 12 moves it 3.86× → 10.69×. **The ratio is set by how many
+times you back up, not by how much changes**, because content-defined chunking confines
+each edit to the one or two chunks that contain it. That is the boundary-shift property
+from T2 showing up as an end-to-end economic result, and it is precisely what fixed-size
+chunking cannot do.
+
+### On the résumé's "about 4 times"
+
+The measured ratio for this workload at 8 generations is **7.36×**; **4× corresponds to
+roughly 4 generations** (3.88×). The bullet is therefore conservative rather than
+overstated — but "about 4 times" with no workload attached is not a checkable claim in
+either direction, which is the real problem with it. See `docs/RESUME.md`.
+
+Every run of this benchmark ends with `verify --deep` over the whole store, and prints
+`!! verify FAILED -- ratio above is meaningless` instead of a number if it does not pass.
+A compression ratio from a store that cannot restore its own data is not a result.

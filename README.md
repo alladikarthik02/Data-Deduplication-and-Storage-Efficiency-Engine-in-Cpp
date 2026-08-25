@@ -60,5 +60,5 @@ dedupe --store <dir> ls | stats | verify [--deep]
 | T6 | Concurrency: multi-threaded ingest | ✅ done |
 | T7 | Background space reclamation (GC) | ✅ done |
 | T8 | Crash & fault injection | ✅ done |
-| T9 | Benchmarks — the résumé's numbers | — |
+| T9 | Benchmarks — the résumé's numbers | ✅ done |
 | T10 | Hardening, docs, résumé reconciliation | — |

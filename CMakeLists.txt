@@ -106,5 +106,8 @@ target_link_libraries(bench_gc PRIVATE dedupe_core)
 
 # Exhaustive crash sweep -- too slow for ctest, run by hand after touching the
 # durability path.
+add_executable(bench_corpus bench/bench_corpus.cpp)
+target_link_libraries(bench_corpus PRIVATE dedupe_core)
+
 add_executable(crashtest tools/crashtest.cpp)
 target_link_libraries(crashtest PRIVATE dedupe_core)

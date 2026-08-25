@@ -55,6 +55,16 @@ void fail_nth(Op op, uint64_t nth, Err code = Err::kIo);
 // the very state a recovery test is trying to create.
 void fail_from(Op op, uint64_t nth, Err code = Err::kIo);
 
+// TEST ONLY. Terminate the process immediately, via _exit(), when the `nth` call
+// to `op` is reached -- BEFORE it is performed.
+//
+// This is the crash simulation (S3). _exit skips destructors, atexit handlers
+// and any buffered data we are holding, which is exactly what a kill -9 does.
+// What it does NOT skip is the kernel's page cache: bytes already handed to
+// write() survive, because the process died and the machine did not. That is the
+// honest limit of what this environment can test, and SPEC 8.6 says so.
+void abort_at(Op op, uint64_t nth);
+
 // TEST ONLY. Arm the `nth` call to write/pwrite to transfer only half its bytes
 // and report success -- the short-write case a naive wrapper silently truncates on.
 void short_nth(Op op, uint64_t nth);

@@ -59,6 +59,6 @@ dedupe --store <dir> ls | stats | verify [--deep]
 | T5 | Store: ingest + restore + CLI | ✅ done |
 | T6 | Concurrency: multi-threaded ingest | ✅ done |
 | T7 | Background space reclamation (GC) | ✅ done |
-| T8 | Crash & fault injection | — |
+| T8 | Crash & fault injection | ✅ done |
 | T9 | Benchmarks — the résumé's numbers | — |
 | T10 | Hardening, docs, résumé reconciliation | — |

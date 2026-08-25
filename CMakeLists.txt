@@ -84,6 +84,9 @@ dedupe_test(test_concurrent)
 dedupe_test(test_gc)
 dedupe_test(test_gc_stress)
 
+# --- T8: crash and fault injection -------------------------------------------
+dedupe_test(test_recovery)
+
 # The CLI.
 add_executable(dedupe tools/dedupe_cli.cpp)
 target_link_libraries(dedupe PRIVATE dedupe_core)
@@ -100,3 +103,8 @@ add_executable(bench_ingest bench/bench_ingest.cpp)
 target_link_libraries(bench_ingest PRIVATE dedupe_core)
 add_executable(bench_gc bench/bench_gc.cpp)
 target_link_libraries(bench_gc PRIVATE dedupe_core)
+
+# Exhaustive crash sweep -- too slow for ctest, run by hand after touching the
+# durability path.
+add_executable(crashtest tools/crashtest.cpp)
+target_link_libraries(crashtest PRIVATE dedupe_core)

@@ -98,8 +98,27 @@ Status Store::rebuild_index() {
     if (name.size() < 4 || name.compare(name.size() - 4, 4, ".dat") != 0) continue;
     const std::string path = path_join(containers_dir(), name);
 
-    // Recover first: a torn tail from a previous crash is truncated before its
-    // records are indexed, so the index never points into damaged bytes (S3).
+    // A container smaller than its own header is an ABORTED CREATION: the file
+    // was created and the process died before the header reached disk. It cannot
+    // contain a chunk, so discarding it is safe -- and necessary, because
+    // otherwise this container makes Store::open fail and the whole store
+    // becomes unopenable over a file that provably holds nothing (CHALLENGES
+    // B17).
+    //
+    // Note the deliberate asymmetry: a file that is big enough for a header but
+    // whose header is INVALID is not discarded. That is real corruption, and
+    // silently deleting it could destroy chunks; it fails loudly instead.
+    ASSIGN_OR_RETURN(const uint64_t container_size, file_size(path));
+    if (container_size < ContainerHeader::kSize) {
+      std::fprintf(stderr,
+                   "dedupe: discarding aborted container %s (%llu bytes, no header)\n",
+                   name.c_str(), static_cast<unsigned long long>(container_size));
+      RETURN_IF_ERROR(unlink_file(path));
+      continue;
+    }
+
+    // Recover: a torn tail from a previous crash is truncated before its records
+    // are indexed, so the index never points into damaged bytes (S3).
     ASSIGN_OR_RETURN(ScanResult scan, recover_container(path));
     if (scan.header.store_uuid != uuid_) {
       return Status::corrupt("container " + name + " belongs to store " +

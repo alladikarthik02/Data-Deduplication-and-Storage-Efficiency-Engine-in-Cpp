@@ -276,3 +276,45 @@ holds one across I/O.
 configuration including idle (19.8 ms idle, 66.7 ms sweep-only, 12.6 ms default) and is
 scheduler and fsync jitter, not a signal. At n=2000, p99 has twenty samples above it and is
 stable; p99.9 would not be, so it is not quoted.
+
+---
+
+## T8 — crash sweep
+
+```bash
+./scripts/dev.sh ./build-none/crashtest 20     # exhaustive; not part of ctest
+./scripts/dev.sh ./build-none/test_recovery    # 16 curated points, in the gate
+```
+
+The child process is killed with `_exit()` from **inside the I/O layer** at the Nth call
+to a given syscall — no destructors, no buffer flush, no cleanup path. The parent then
+reopens the store, runs `verify --deep`, and restores every file that exists.
+
+**The assertion is that presence implies correctness.** A file may legitimately be missing
+— it was mid-ingest and never published — but a file that *exists* and restores wrong
+means the engine lost data while reporting success.
+
+| syscall class | points | real crashes | failures |
+|---|---:|---:|---:|
+| `write` | 20 | 20 | 0 |
+| `fsync` | 20 | 20 | 0 |
+| `rename` | 20 | 5 | 0 |
+| `fsync_dir` | 20 | 5 | 0 |
+| `open` | 20 | 6 | 0 |
+| `truncate` | 20 | 0 | 0 |
+| GC: `write` | 20 | 5 | 0 |
+| GC: `fsync` | 20 | 5 | 0 |
+| GC: `unlink` | 20 | 4 | 0 |
+| **total** | **180** | **52** | **0** |
+
+"Real crashes" counts the points where the workload actually reached that many calls; the
+rest completed first, which is a legitimate outcome rather than a skipped test.
+
+**Found one real bug** on the very first run: a crash between creating a container file and
+writing its header left a zero-byte file that made `Store::open` fail outright —
+total unavailability from a file that provably held nothing (`CHALLENGES.md` B17).
+
+**What this does not prove.** The process dies; the machine does not. Bytes already handed
+to `write()` are in the kernel's page cache and survive. This is **process-crash
+consistency**, not power-loss durability — SPEC §8.6 says the same, and conflating the two
+is the standard way a storage project overclaims.

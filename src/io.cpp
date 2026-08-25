@@ -4,6 +4,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <cstdlib>
 
 #include <algorithm>
 #include <array>
@@ -22,6 +23,7 @@ struct State {
   std::array<std::atomic<uint64_t>, kOpCount> fail_at{};   // 0 = disarmed
   std::array<std::atomic<uint64_t>, kOpCount> fail_from{}; // 0 = disarmed
   std::array<std::atomic<uint64_t>, kOpCount> short_at{};  // 0 = disarmed
+  std::array<std::atomic<uint64_t>, kOpCount> abort_at{};  // 0 = disarmed
   std::array<std::atomic<int>, kOpCount> fail_code{};
 };
 
@@ -60,6 +62,10 @@ void fail_from(Op op, uint64_t nth, Err code) {
   state().fail_code[i].store(static_cast<int>(code), std::memory_order_relaxed);
 }
 
+void abort_at(Op op, uint64_t nth) {
+  state().abort_at[static_cast<size_t>(op)].store(nth, std::memory_order_relaxed);
+}
+
 void short_nth(Op op, uint64_t nth) {
   state().short_at[static_cast<size_t>(op)].store(nth, std::memory_order_relaxed);
 }
@@ -70,6 +76,7 @@ void reset() {
     state().fail_at[i].store(0, std::memory_order_relaxed);
     state().fail_from[i].store(0, std::memory_order_relaxed);
     state().short_at[i].store(0, std::memory_order_relaxed);
+    state().abort_at[i].store(0, std::memory_order_relaxed);
     state().fail_code[i].store(0, std::memory_order_relaxed);
   }
 }
@@ -86,6 +93,11 @@ namespace {
 Status tick(Op op) {
   const size_t i = static_cast<size_t>(op);
   const uint64_t n = state().counts[i].fetch_add(1, std::memory_order_relaxed) + 1;
+  const uint64_t kill = state().abort_at[i].load(std::memory_order_relaxed);
+  if (kill != 0 && n >= kill) {
+    // Die here, before the operation happens. No unwinding, no flush -- a crash.
+    ::_exit(9);
+  }
   const uint64_t from = state().fail_from[i].load(std::memory_order_relaxed);
   const uint64_t at = state().fail_at[i].load(std::memory_order_relaxed);
   if ((at != 0 && n == at) || (from != 0 && n >= from)) {

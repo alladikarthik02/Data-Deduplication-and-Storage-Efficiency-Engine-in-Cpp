@@ -854,3 +854,58 @@ better — collecting garbage shrinks the store the foreground is working in. Se
 **Generalizes to.** Independence is a property of the *harness*, not the subject. If two
 cases can influence each other through shared state, the harness is part of the
 experiment. And a result that flips sign when you change the harness is the harness talking.
+
+---
+
+## B17 💾 A crash one syscall into creating a container made the whole store unopenable
+
+**Symptom.** The first run of the crash suite. Thirteen of fourteen injection points
+recovered cleanly; one did not, and it failed in the worst possible way:
+
+```
+[info] 1st write (mid container append)   crashed=1  files present 0
+    PROBLEM: open failed: corrupt: container c00000000.dat: too small (0 bytes)
+```
+
+Not a lost file — `Store::open` **refused to open the store at all**.
+
+**Root cause.** `ContainerWriter::create` opens the file with `O_CREAT | O_EXCL` and then
+writes the 32-byte header. Kill the process between those two steps and a zero-byte
+container is left behind. On the next open, `rebuild_index` calls
+`ContainerReader::open`, which quite correctly reports that a file too small to hold a
+header is not a container — and that error propagates all the way out of `Store::open`.
+
+So a crash in a one-syscall window bricked a store over a file that **provably contains
+nothing**: no header means no records, and no records means no chunk anyone could
+reference.
+
+**Why this is the worst class of bug in the project.** Every other crash outcome so far
+was "a file that was mid-ingest did not appear", which is correct and expected. This one
+is total unavailability, from the most trivially recoverable state imaginable, and it
+would have hit on the first unlucky crash in production. It is also the kind of bug that
+only a systematic sweep finds: nobody hand-writes "crash at the first write of a brand
+new container" as a test case.
+
+**Fix — with a deliberate asymmetry.**
+
+- Container **smaller than one header** → an aborted creation. Discard it and carry on
+  (logged, not silent).
+- Container **big enough for a header, but the header is invalid** → real corruption. Fail
+  loudly; do not touch it.
+
+The distinction matters. Auto-deleting anything that fails to parse would be a collector
+that destroys data whenever it is confused. Auto-deleting a file that cannot physically
+contain a chunk is just cleaning up after ourselves. The rule is: **only discard what is
+provably empty.**
+
+**How it was found.** Injecting the crash at the *syscall* level rather than at "some
+interesting moment" — the child dies at the Nth write / fsync / rename / unlink, so the
+sweep walks straight through windows nobody would think to name. The exhaustive tool
+covers 180 points across nine syscall classes; `test_recovery` keeps sixteen of them in
+the gate.
+
+**Generalizes to.** Recovery code must be at least as robust as the code it recovers from,
+and the failure mode to fear is refusing to start, not losing a file. And any create-then-
+initialize sequence has a window where the artifact exists but is not yet valid — enumerate
+what the artifact looks like in that window and decide, on purpose, what recovery should do
+with it.

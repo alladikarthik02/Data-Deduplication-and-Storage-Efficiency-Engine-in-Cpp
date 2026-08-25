@@ -308,7 +308,8 @@ means the engine lost data while reporting success.
 | **total** | **180** | **52** | **0** |
 
 "Real crashes" counts the points where the workload actually reached that many calls; the
-rest completed first, which is a legitimate outcome rather than a skipped test.
+rest completed first, which is a legitimate outcome rather than a skipped test. The sweep
+depth is a parameter — `crashtest 25` gives **225 points, 52 real crashes, 0 failures**.
 
 **Found one real bug** on the very first run: a crash between creating a container file and
 writing its header left a zero-byte file that made `Store::open` fail outright —

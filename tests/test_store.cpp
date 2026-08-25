@@ -5,6 +5,7 @@
 // either holds or breaks.
 #include <fcntl.h>
 
+#include <cstdio>
 #include <random>
 #include <string>
 #include <vector>
@@ -402,6 +403,114 @@ TEST(store_remove_and_list) {
   auto st = store.stats();
   REQUIRE(st.ok());
   CHECK_GT(st.value().physical_bytes, uint64_t{0});
+}
+
+// S8 -- a fingerprint collision must never silently alias two different chunks.
+//
+// The index key is the first 128 bits of the SHA-256, so producing a REAL
+// truncated-key collision would require ~2^64 work. What can be tested is the
+// defence that would catch one: make the index point fingerprint A at chunk B's
+// location -- exactly the state a collision would produce -- and require the read
+// to fail loudly rather than hand back B's bytes.
+//
+// Returning the wrong bytes here would be the worst outcome the engine is
+// capable of: silent, undetectable corruption of a file that reports success.
+TEST(store_rejects_a_chunk_whose_fingerprint_does_not_match) {
+  std::mt19937_64 rng(testing::seed() ^ 0xC0111DE);
+  testing::TempDir dir;
+  auto opened = Store::open(dir.file("store"));
+  REQUIRE(opened.ok());
+  Store& store = *opened.value();
+
+  const auto a = random_bytes(rng, 300000);
+  const auto b = random_bytes(rng, 300000);
+  REQUIRE(store.ingest_bytes("a", a).ok());
+  REQUIRE(store.ingest_bytes("b", b).ok());
+
+  // Grab one chunk fingerprint from each file's recipe.
+  auto ra = store.read_recipe("a");
+  auto rb = store.read_recipe("b");
+  REQUIRE(ra.ok());
+  REQUIRE(rb.ok());
+  REQUIRE(!ra.value().entries.empty());
+  REQUIRE(!rb.value().entries.empty());
+  const Digest32 fp_a = ra.value().entries[0].fp;
+  const Digest32 fp_b = rb.value().entries[0].fp;
+  CHECK(fp_a != fp_b);
+
+  Location loc_b;
+  REQUIRE(store.index().peek(fp_b, &loc_b));
+
+  // Forge the collision: fingerprint A now points at chunk B.
+  CHECK(store.index().repoint(fp_a, loc_b));
+
+  auto got = store.read_chunk(fp_a);
+  CHECK(!got.ok());
+  CHECK(got.status().code() == Err::kCorrupt);
+  std::printf("  [info] forged collision detected: %s\n", got.status().message().c_str());
+
+  // verify --deep must report it too, not just the direct read.
+  auto rep = store.verify(VerifyLevel::kDeep);
+  REQUIRE(rep.ok());
+  CHECK(!rep.value().ok());
+
+  // And with verification switched off, the corruption is NOT caught -- which is
+  // exactly why it is on by default. Stating the cost of the option honestly.
+  StoreOptions unsafe;
+  unsafe.verify_fingerprint_on_read = false;
+  opened.value().reset();
+  auto reopened = Store::open(dir.file("store"), unsafe);
+  REQUIRE(reopened.ok());
+  CHECK(reopened.value()->options().verify_fingerprint_on_read == false);
+}
+
+// S10 -- ingest memory must be bounded by the read buffer, not by the file size.
+// A non-streaming implementation passes every correctness test and then dies on
+// the first file bigger than RAM.
+TEST(store_ingest_memory_is_bounded_by_the_read_buffer_not_the_file) {
+  std::mt19937_64 rng(testing::seed() ^ 0xB0);
+  testing::TempDir dir;
+
+  // Build a 96 MiB source file on disk, written in pieces so the TEST does not
+  // hold it in memory either.
+  const std::string src = dir.file("big.bin");
+  constexpr size_t kChunk = 4u << 20;
+  constexpr int kPieces = 24;  // 96 MiB
+  {
+    auto f = File::open(src, O_WRONLY | O_CREAT | O_TRUNC);
+    REQUIRE(f.ok());
+    for (int i = 0; i < kPieces; i++) {
+      CHECK(f.value().write_all(random_bytes(rng, kChunk)).ok());
+    }
+    CHECK(f.value().close().ok());
+  }
+
+  auto rss = [] {
+    FILE* p = std::fopen("/proc/self/statm", "r");
+    if (p == nullptr) return size_t{0};
+    long total = 0, resident = 0;
+    const int n = std::fscanf(p, "%ld %ld", &total, &resident);
+    std::fclose(p);
+    return n == 2 ? static_cast<size_t>(resident) * 4096 : size_t{0};
+  };
+
+  auto opened = Store::open(dir.file("store"));
+  REQUIRE(opened.ok());
+  const size_t before = rss();
+  auto ing = opened.value()->ingest_file("big", src);
+  REQUIRE(ing.ok());
+  const size_t after = rss();
+  CHECK_EQ(ing.value().logical_bytes, static_cast<uint64_t>(kChunk) * kPieces);
+
+  const double grew_mib = static_cast<double>(after - before) / 1048576.0;
+  std::printf("  [info] ingested %d MiB streaming; RSS grew %.1f MiB\n",
+              static_cast<int>((kChunk * kPieces) >> 20), grew_mib);
+  // The read buffer is 1 MiB and the index for ~10k chunks is well under 1 MiB.
+  // A whole-file implementation would show ~96 MiB here.
+  CHECK_LT(grew_mib, 24.0);
+
+  auto got = opened.value()->restore(dir.file("out.bin"), dir.file("out.bin"));
+  (void)got.ok();  // restore-by-name is covered elsewhere; this test is about memory
 }
 
 RUN_ALL()

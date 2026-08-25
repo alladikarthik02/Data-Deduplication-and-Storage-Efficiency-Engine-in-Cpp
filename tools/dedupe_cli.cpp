@@ -3,12 +3,16 @@
 // Deliberately thin: every operation is one call into Store, so the CLI cannot
 // be where the interesting behaviour lives. Exit codes matter (scripts and the
 // test harness depend on them): 0 success, 1 usage, 2 operation failed.
+#include <algorithm>
+#include <chrono>
 #include <cinttypes>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 #include <string>
 #include <vector>
 
+#include "dedupe/gc.h"
 #include "dedupe/store.h"
 
 using namespace dedupe;
@@ -23,6 +27,7 @@ int usage() {
                "  restore <name> <out>     rebuild a file\n"
                "  cat <name>               rebuild a file to stdout\n"
                "  rm <name>                delete a file (space returns via gc)\n"
+               "  gc [--daemon <secs>]     reclaim space; --daemon loops until Ctrl-C\n"
                "  ls                       list stored files\n"
                "  stats                    dedup ratio, footprint, index cost\n"
                "  verify [--deep]          consistency check\n"
@@ -110,6 +115,36 @@ int main(int argc, char** argv) {
     const Status st = store.remove(args[1]);
     if (!st.ok()) return fail(st);
     std::printf("removed %s (space returns after gc)\n", args[1].c_str());
+    return 0;
+  }
+  if (cmd == "gc") {
+    Gc gc(&store);
+    if (args.size() > 2 && args[1] == "--daemon") {
+      GcOptions opts;
+      opts.interval = std::chrono::seconds(std::strtol(args[2].c_str(), nullptr, 10));
+      Gc daemon(&store, opts);
+      daemon.start();
+      std::printf("gc running every %llds; press Ctrl-C to stop\n",
+                  static_cast<long long>(opts.interval.count() / 1000));
+      // The collector runs on its own thread; this one just waits.
+      while (true) std::this_thread::sleep_for(std::chrono::seconds(1));
+    }
+    auto r = gc.run_once();
+    if (!r.ok()) return fail(r.status());
+    const GcStats& g = r.value();
+    std::printf("epoch %u (reclaim watermark %u)\n", g.epoch, g.safe_epoch);
+    std::printf("scanned %" PRIu64 " recipes, marked %" PRIu64 " chunk references\n",
+                g.recipes_scanned, g.marked);
+    std::printf("swept %" PRIu64 " index entries\n", g.swept);
+    std::printf("containers: %" PRIu64 " examined, %" PRIu64 " deleted, %" PRIu64 " compacted "
+                "(%" PRIu64 " chunks copied)\n",
+                g.containers_examined, g.containers_deleted, g.containers_compacted,
+                g.chunks_copied);
+    if (g.bytes_reclaimed() != 0) {
+      std::printf("reclaimed %s\n",
+                  human(static_cast<uint64_t>(std::max<int64_t>(0, g.bytes_reclaimed()))).c_str());
+    }
+    std::printf("%.3fs\n", g.seconds);
     return 0;
   }
   if (cmd == "ls") {

@@ -1,58 +1,31 @@
-# Data Deduplication and Storage Efficiency Engine
+# dedupe
 
-A single-node, content-addressed **deduplicating storage engine in C++20**, written from
-scratch with **no external dependencies** — the chunker, SHA-256, CRC32C, hash index,
-on-disk formats, crash recovery and garbage collector are all implemented here.
+A deduplicating storage engine for backup data, written in C++20 with no external
+dependencies. The chunker, SHA-256, CRC32C, hash index, on-disk formats, crash recovery
+and garbage collector are all implemented in this repository.
 
-Files are split into content-defined chunks, fingerprinted with SHA-256, and only chunks
-the store has never seen are written. A background collector reclaims unreferenced chunks
-while ingests and restores keep running.
+It splits each file into content-defined chunks, names every chunk by the SHA-256 of its
+bytes, and writes a chunk only if the store has not seen it before. A stored file becomes
+a *recipe*: an ordered list of fingerprints and nothing else. A background collector
+reclaims chunks that no recipe references any more, while ingest and restore keep running.
 
-```
-7.36×   storage reduction across 8 full backup generations of a 2,000-file tree
-0.99×   on unique random data — the control that proves the ratio is real
- ±20%   foreground p50/p90/p99 latency impact while the collector runs
-  225   crash-injection points, 52 real process kills, 0 failures
-  309   test runs per gate (103 tests × normal, ASan+UBSan, TSan)
-```
+On eight successive backups of a 2,000-file tree it held 3,766 MiB of logical data in
+511 MiB on disk, a 7.36x reduction. Run against unique random data instead, the same
+engine reports 0.99x, which is the control that shows the ratio comes from real redundancy
+in the corpus rather than from the benchmark.
 
-**Contents** · [Quick start](#quick-start) · [CLI](#cli) · [How it works](#how-it-works) ·
-[Design decisions](#design-decisions) · [Results](#results) · [Testing](#testing) ·
-[Layout](#repository-layout) · [Documentation](#documentation) · [Limitations](#limitations)
+## Building and running
 
----
-
-## Why
-
-A nightly backup is almost identical to the one before it, but a naïve store pays for
-every copy. Deduplication fixes that, and the hard part is not the deduplication itself —
-that is one hash lookup. The hard part is staying correct while:
-
-- the process is **killed mid-write**,
-- several threads are **writing at the same time**, and
-- a collector is **deleting chunks underneath them**.
-
-Those three constraints shaped every design decision below.
-
----
-
-## Quick start
-
-Everything builds and runs **inside Linux in Docker**. The correctness claims are about
-`fsync` ordering, atomic `rename`, torn-tail recovery and `flock`, all of which behave
-differently on macOS/APFS, so the container is the target platform rather than a
-convenience.
-
-**Requirements:** Docker. Nothing else — no system libraries, no package installs.
+Everything builds and runs inside Linux in a container. That is not a convenience: the
+guarantees here are about `fsync` ordering, atomic `rename`, torn-tail recovery and
+`flock`, and all four behave differently on macOS. Docker is the only requirement.
 
 ```bash
-git clone https://github.com/alladikarthik02/Data-Deduplication-and-Storage-Efficiency-Engine-in-Cpp.git
-cd Data-Deduplication-and-Storage-Efficiency-Engine-in-Cpp
-
-./scripts/dev.sh ./scripts/check.sh        # build + run every test, all 3 configurations
+./scripts/dev.sh ./scripts/check.sh     # build and run every test, in all three configurations
 ```
 
-Store a file, inspect the store, verify it end to end:
+`scripts/dev.sh` builds the image the first time and bind-mounts the repository, so you
+edit on the host and compile on Linux.
 
 ```bash
 ./scripts/dev.sh bash -c '
@@ -63,212 +36,167 @@ Store a file, inspect the store, verify it end to end:
 '
 ```
 
-`scripts/dev.sh` builds the image on first use and bind-mounts the repo, so edits stay on
-the host while compilation and execution happen on Linux.
-
----
-
-## CLI
+The command surface is small:
 
 ```
-dedupe --store <dir> ingest <file> [name]   # add a file
-dedupe --store <dir> restore <name> <out>   # rebuild it, byte-exact
-dedupe --store <dir> cat <name>             # ...to stdout
-dedupe --store <dir> rm <name>              # delete (space returns via gc)
-dedupe --store <dir> gc [--daemon <secs>]   # reclaim space
-dedupe --store <dir> ls                     # list stored files
-dedupe --store <dir> stats                  # logical vs physical bytes, dedup ratio
-dedupe --store <dir> verify [--deep]        # check the whole store
+dedupe --store <dir> ingest <file> [name]    add a file
+dedupe --store <dir> restore <name> <out>    rebuild it, byte for byte
+dedupe --store <dir> cat <name>              the same, to stdout
+dedupe --store <dir> rm <name>               delete (space returns at the next gc)
+dedupe --store <dir> gc [--daemon <secs>]    reclaim space
+dedupe --store <dir> ls | stats | verify [--deep]
 ```
-
----
 
 ## How it works
 
+**Chunk boundaries come from the data, not from the offset.** Cutting every 8 KiB would
+mean that inserting a single byte near the start of a file shifts every later boundary, so
+every chunk looks new and the whole file is stored again. Instead a Gear rolling hash runs
+over the bytes and a cut is made where the hash matches a mask, which makes boundaries
+follow content: after a one-byte insertion, 99.9% of boundaries survive, against 0.0% for
+a fixed-size control. Chunks average 9.3 KiB, with a 2 KiB floor and a 64 KiB ceiling that
+only data with no variety (a long run of zeros, say) ever reaches.
+
+**Chunks are named by SHA-256 of their contents.** Deduplication is then one index lookup.
+A cryptographic hash is not overkill here: if two different chunks ever shared a
+fingerprint, the second would silently never be stored, so collision resistance is a
+correctness requirement rather than a nicety. The index keeps only the first 128 bits of
+each fingerprint to halve its memory, and every read verifies the full 32 bytes from the
+chunk's own header, so a truncated-key collision would fail loudly instead of returning
+the wrong bytes.
+
+**Containers and recipes on disk are the only authoritative state.** Chunks are appended
+to container files as self-describing records: a 48-byte header carrying the length, a
+CRC32C, and the full fingerprint, followed by the payload. Because each record describes
+itself, the in-memory index is a cache that is rebuilt by scanning containers whenever the
+store opens. Losing it costs startup time, not data, which turns index durability from a
+correctness problem into a performance one.
+
+**Durability is an ordering rule.** Never publish a reference before the data it points at
+is on the disk. Publishing a file therefore looks like this:
+
 ```
-  ingest                                          restore
-  ──────                                          ───────
-  file bytes                                      recipe: (fingerprint, length)*
-      │                                                │
-      ▼                                                ▼
-  FastCDC chunker      cut points chosen by        index lookup
-  (Gear rolling hash)  CONTENT, not offset         fingerprint → container:offset:length
-      │                                                │
-      ▼                                                ▼
-  SHA-256              32-byte fingerprint         read + verify CRC + verify fingerprint
-      │                                                │
-      ▼                                                ▼
-  index probe          hit → reuse, miss → write   whole-file SHA-256 check
-      │
-      ▼
-  container            append-only, self-describing records
-      │                fsync BEFORE the recipe is published
-      ▼
-  recipe               tmp → fsync → rename → fsync(dir)   ← the atomic commit
+append chunks to containers
+fsync every container this recipe references   (including ones other threads wrote)
+write the recipe to a temporary file
+fsync it
+rename it into place                           (atomic: the file appears whole or not at all)
+fsync the directory                            (so the name itself is durable)
 ```
 
-**Five nouns.** A **chunk** is a variable-sized piece of a file. Its **fingerprint** is the
-SHA-256 of its bytes. **Containers** are append-only files holding chunk records. A
-**recipe** is one file's ordered list of fingerprints — it holds no data. The **index**
-maps fingerprint → location.
+A crash can leave four states, and only one of them is unacceptable: a recipe on disk
+pointing at chunks that never reached it, which is a file that lists but cannot be read.
+The ordering above makes that state unreachable. Recovery truncates any torn tail at the
+first record that fails its checks, which is safe precisely because a published recipe can
+only reference bytes that were already fsynced.
 
-**The one idea everything rests on:** containers and recipes are the only authoritative
-state. The in-memory index is a **cache**, rebuilt by scanning containers on every open.
-That turns index durability from a correctness problem into a performance problem, and it
-works because every chunk record on disk is self-describing: a 48-byte header carrying the
-full fingerprint, the length and a CRC32C.
+**Space is reclaimed by mark and sweep, not reference counts.** Counts race with in-flight
+deduplication hits, and they cannot heal: one lost decrement leaks a chunk forever and
+nothing ever notices. Instead the collector walks every recipe, marks what it finds, and
+removes index entries that are both unmarked and untouched since before the oldest ingest
+still running. Containers that fall below half live are rewritten and the originals
+deleted, with the intent written to a journal first so an interrupted compaction is either
+finished or undone on the next open.
 
-**Durability is an ordering rule, not a feature:** never publish a reference before the
-data it points at is durable. The same rule appears at three levels — chunks before
-recipes, file contents before the rename that names them, journal record before the
-irreversible action.
+**Threads are kept apart rather than serialized.** Each ingest writes to its own container,
+and the index is split into 256 independently locked shards chosen by the first byte of the
+fingerprint, with lookups taking a shared lock. The cost is restore locality, since one
+file's chunks end up spread across containers.
 
----
+## Measurements
 
-## Design decisions
+Every number below is produced by a command recorded in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
 
-Each with its reasoning, and the alternative it was chosen over. Full arguments in
-[`docs/SPEC.md`](docs/SPEC.md).
+| | |
+|---|---|
+| Storage reduction, 8 backups of a 2,000-file tree, 3% churn | 7.36x |
+| Same engine, unique random data (control) | 0.99x |
+| Boundary preservation after a 1-byte insert, content-defined vs fixed | 99.9% vs 0.0% |
+| Index memory, 1M fingerprints | 51.5 B/entry, against 92.7 for a tuned `unordered_map` |
+| Ingest throughput, 1 thread to 8 | 275 to 893 MB/s |
+| SHA-256, portable and hardware-dispatched | 124 and 2,074 MB/s |
+| CRC32C, portable and hardware-dispatched | 2,085 and 8,056 MB/s |
+| Crash injection | 225 points, 52 real process kills, 0 failures |
+| Collector running against idle, p50/p90/p99 | within 20% |
 
-| choice | over | because |
-|---|---|---|
-| Content-defined chunking | fixed-size blocks | one byte inserted at offset 0 destroys **every** fixed-size block; CDC keeps 99.9% |
-| FastCDC / Gear | Rabin fingerprinting | one shift + add + lookup per byte instead of multiply + modulo, same effective window |
-| SHA-256 | xxHash / CityHash | content addressing makes "same fingerprint ⇒ same bytes" a *correctness* assumption; a collision is silent data loss |
-| 128-bit index key | full 256-bit | halves index RAM; ~10⁻²¹ collision risk at 10⁹ chunks, and every read verifies the full fingerprint from disk |
-| Epoch mark-and-sweep | reference counting | refcounts race with in-flight dedup hits and cannot self-heal — one lost decrement leaks forever, one lost increment corrupts |
-| Robin Hood open addressing | `std::unordered_map` | 1.8× less memory than a *tuned* baseline, and no pointer chase per lookup |
-| Backward-shift deletion | tombstones | tombstones never go away; a delete-heavy store degrades until it is rebuilt |
-| 1.5× index growth | doubling | doubling leaves the table half empty on average; 1.5× holds the load factor between 0.6 and 0.9 |
-| Per-thread containers | one shared container | removes the global append lock; costs restore locality, which is stated rather than hidden |
-| Runtime CPU dispatch | `-march=native` | one portable binary that still gets hardware SHA-256 and CRC32C |
+The reduction is set by how many times you back up rather than by how much changes
+between backups: raising churn from 1% to 25% moved the ratio only from 7.14x to 6.84x,
+while going from 4 generations to 12 moved it from 3.86x to 10.69x. That is what
+content-defined chunking buys, since each edit is confined to the chunk containing it.
 
----
+Ingest does not scale linearly with threads because it is bound by `fsync`, not by lock
+contention. Batching container writes cut write syscalls 88-fold and changed throughput by
+nothing measurable, which is the evidence for that claim rather than an assertion.
 
-## Results
-
-Every number is reproduced by one command, listed with the measurement in
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
-
-**Storage reduction** — 2,000-file tree, 8 successive full backups, 3% of files modified
-between generations (plus 1% created, 1% deleted), chunk payloads uncompressed:
-
-| generation | 1 | 2 | 4 | 6 | 8 |
-|---|---|---|---|---|---|
-| logical | 467 MiB | 936 MiB | 1,877 MiB | 2,816 MiB | 3,766 MiB |
-| physical | 470 MiB | 474 MiB | 483 MiB | 495 MiB | 511 MiB |
-| ratio | 0.99× | 1.97× | 3.88× | 5.69× | **7.36×** |
-
-Generation 1 lands just *under* 1.0× — correct, because a 48-byte record header on every
-~9.3 KiB chunk costs ~0.5% when there is nothing to deduplicate. An engine reporting a
-gain there would be one to distrust.
-
-The ratio is set by **how many times you back up, not by how much changes**: on a separate
-1,000-file run, raising churn 25-fold (1% → 25%) moved it only 7.14× → 6.84×, while going
-from 4 generations to 12 moved it 3.86× → 10.69×. Content-defined chunking confines each
-edit to the chunk or two containing it.
-
-**Throughput and memory:**
-
-| | measured | note |
-|---|---|---|
-| SHA-256 | 2,074 MB/s | 124 MB/s portable; 16.7× from runtime-dispatched ARMv8 SHA-2 |
-| CRC32C | 8,056 MB/s | 2,085 MB/s portable table path |
-| Chunker | 1,806 MB/s | within 4% of the zero-copy ceiling |
-| Index | **51.5 B/entry** | vs 92.7 for a tuned `unordered_map` — 1.8× smaller |
-| Ingest | 275 → 893 MB/s | 1 → 8 threads (3.25×); the remainder is `fsync`, not lock contention |
-
-**Correctness:** boundary preservation after a 1-byte insert is **99.9%** for CDC against
-**0.0%** for a fixed-size control; 225 crash-injection points produce 0 failures; GC
-running flat out keeps foreground latency within ±20% of idle.
-
----
-
-## Testing
+## Tests
 
 ```bash
 ./scripts/dev.sh ./scripts/check.sh          # all three configurations
 ./scripts/dev.sh ./scripts/check.sh none     # just the fast one
 ```
 
-Three configurations, because ASan and TSan cannot coexist in one binary:
-
-| configuration | catches |
-|---|---|
-| normal `-O2` | the code that is actually shipped and benchmarked |
-| ASan + UBSan | memory safety, undefined behaviour |
-| TSan | data races, lock-order inversions |
-
-Randomized tests are seeded and print the seed, so a failure replays exactly:
+103 tests in 13 suites, each run normally, under ASan with UBSan, and under TSan, which is
+309 runs per gate. Three builds rather than one because ASan and TSan cannot share a
+binary. Randomized tests print their seed, so a failure replays exactly:
 
 ```bash
 DEDUPE_SEED=0x... ./build-none/test_gc_stress
 ```
 
-Benchmarks and the crash sweep are run explicitly, never in the test gate:
+Benchmarks and the crash sweep are slow and deliberately kept out of the gate:
 
 ```bash
-./scripts/dev.sh ./build-none/bench_corpus    # storage-reduction numbers
-./scripts/dev.sh ./build-none/bench_gc        # GC vs foreground latency
-./scripts/dev.sh ./build-none/crashtest 20    # exhaustive crash sweep (slow)
+./scripts/dev.sh ./build-none/bench_corpus    # the storage-reduction figures
+./scripts/dev.sh ./build-none/bench_gc        # collector against foreground latency
+./scripts/dev.sh ./build-none/crashtest 20    # kill -9 at the Nth syscall, exhaustively
 ```
 
----
-
-## Repository layout
+## Layout
 
 ```
-include/dedupe/     public headers — chunker, sha256, crc32c, index, container,
-                    format, io, store, gc, gc_journal, status, types
-src/                implementation: container, format, index, io, store, gc, gc_journal
-tests/              13 suites, from unit tests to concurrent stress and crash recovery
-bench/              chunker, hash, index, ingest, gc, and the storage-reduction corpus
-tools/              dedupe CLI, and crashtest (kill -9 at the Nth syscall)
-scripts/            dev.sh (run anything in the container), check.sh (build + test)
-docs/               SPEC, CHALLENGES, BENCHMARKS, CLAIMS
-scratch/            the ARMv8 SHA-2 spike that preceded the hardware backend
+include/dedupe/   public headers: chunker, sha256, crc32c, index, container, format,
+                  io, store, gc, gc_journal, status, types
+src/              implementations of the above
+tests/            13 suites, from unit tests to concurrent stress and crash recovery
+bench/            chunker, hashes, index, ingest, collector, and the backup corpus
+tools/            the CLI, and crashtest
+scripts/          dev.sh runs anything in the container; check.sh builds and tests
+docs/             SPEC, CHALLENGES, BENCHMARKS, CLAIMS
+scratch/          the ARMv8 SHA-2 spike that preceded the hardware backend
 ```
-
----
 
 ## Documentation
 
-| | |
-|---|---|
-| [`docs/SPEC.md`](docs/SPEC.md) | Architecture, the essential function surface, **safety requirements S1–S14** (each row names the test that proves it), the task breakdown, and the holes found by attacking the design on purpose |
-| [`docs/CHALLENGES.md`](docs/CHALLENGES.md) | **The engineering journal** — 17 defects with the reasoning that found them, including the wrong first diagnoses |
-| [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Every number, with the command that produced it |
-| [`docs/CLAIMS.md`](docs/CLAIMS.md) | What the headline claims assert vs. what was measured |
+[docs/SPEC.md](docs/SPEC.md) is the design document: architecture, the required function
+surface, safety requirements S1 to S14 with the test that proves each one, the task
+breakdown the project was built in, and the holes found by attacking the design.
 
-If you read one, read `CHALLENGES.md`. Highlights: a safety argument in the spec that was
-**wrong** and destroyed live data under load; a stale cached file size that made the
-collector delete a full container; 32 bytes of every recipe sitting outside the checksum;
-two optimizations that measured as completely worthless; and three benchmarks that were
+[docs/CHALLENGES.md](docs/CHALLENGES.md) is the engineering journal, 17 defects written up
+with the reasoning that found them, including the first diagnoses that were wrong. It is
+the one worth reading. Among them: a safety argument in the spec that was itself wrong and
+destroyed live data under concurrent load, a stale cached file size that made the collector
+delete a container full of live chunks, 32 bytes of every recipe sitting outside its
+checksum, two optimizations that measured as worthless, and three benchmarks that were
 measuring themselves.
 
----
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) has every measurement with the command that
+produced it. [docs/CLAIMS.md](docs/CLAIMS.md) checks each headline claim against what was
+actually measured, and rewrites the ones the numbers did not support.
 
 ## Limitations
 
-Stated here rather than left for a reader to discover. The reasoning for each is in
-[`docs/SPEC.md`](docs/SPEC.md) §1 and §8.
+The crash tests kill the process, so the operating system's page cache survives them. That
+is crash consistency, not power-loss durability, and proving the latter needs hardware.
 
-- **Process-crash consistency is tested; power-loss durability is not.** The crash tests
-  kill the process, so the OS page cache survives. Proving power-loss behaviour needs real
-  hardware.
-- **The index is RAM-resident**, roughly 5–6 GB per TB of unique data. That is the real
-  ceiling on how much one machine can hold; a production system would tier it to disk
-  behind a filter and a locality-preserving cache.
-- **No compression**, deliberately, so the storage reduction is attributable to
-  deduplication alone.
-- **Mark-and-sweep reads every recipe per cycle**, so collector cost scales with total
-  data rather than with garbage.
-- **Per-thread containers scatter a file's chunks**, which trades restore locality for
-  write throughput.
-- No FUSE filesystem, no multi-node replication, no on-disk index tier.
+The index lives in RAM, roughly 5 to 6 GB per TB of unique data, which is the real ceiling
+on how much one machine can hold. A production system would tier it to disk behind a
+filter and a locality-preserving cache.
 
----
+Chunk payloads are not compressed, deliberately, so that the storage reduction is
+attributable to deduplication alone. The collector reads every recipe each cycle, so its
+cost scales with total data rather than with garbage. There is no FUSE filesystem, no
+multi-node replication, and no on-disk index tier.
 
 ## License
 
-BSD 3-Clause. See [`LICENSE`](LICENSE).
+BSD 3-Clause. See [LICENSE](LICENSE).

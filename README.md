@@ -14,6 +14,25 @@ On eight successive backups of a 2,000-file tree it held 3,766 MiB of logical da
 engine reports 0.99x, which is the control that shows the ratio comes from real redundancy
 in the corpus rather than from the benchmark.
 
+## Contents
+
+- [Building and running](#building-and-running)
+- [Using the command line](#using-the-command-line)
+- [Using the library](#using-the-library)
+- [Architecture](#architecture)
+  - [Components](#components)
+  - [What the store looks like on disk](#what-the-store-looks-like-on-disk)
+  - [The ingest path](#the-ingest-path)
+  - [The restore path](#the-restore-path)
+  - [Threads](#threads)
+- [Design decisions](#design-decisions)
+- [Measurements](#measurements)
+- [Tests](#tests)
+- [Repository layout](#repository-layout)
+- [Documentation](#documentation)
+- [Limitations](#limitations)
+- [License](#license)
+
 ## Building and running
 
 Everything builds and runs inside Linux in a container. That is not a convenience: the
@@ -25,7 +44,10 @@ guarantees here are about `fsync` ordering, atomic `rename`, torn-tail recovery 
 ```
 
 `scripts/dev.sh` builds the image the first time and bind-mounts the repository, so you
-edit on the host and compile on Linux.
+edit on the host and compile on Linux. The three build directories it produces are
+`build-none`, `build-address` and `build-thread`.
+
+## Using the command line
 
 ```bash
 ./scripts/dev.sh bash -c '
@@ -47,7 +69,184 @@ dedupe --store <dir> gc [--daemon <secs>]    reclaim space
 dedupe --store <dir> ls | stats | verify [--deep]
 ```
 
-## How it works
+## Using the library
+
+The CLI is a thin wrapper over `include/dedupe/store.h`; anything it does is available to
+a caller. Link against the static library the build produces:
+
+```cmake
+target_link_libraries(myapp PRIVATE dedupe_core)
+target_include_directories(myapp PRIVATE ${CMAKE_SOURCE_DIR}/include)
+```
+
+Nothing throws. Fallible calls return `Status` (ok, or an error code and message) or
+`Result<T>` (a `Status` plus a value), both marked `[[nodiscard]]`, so ignoring a failed
+`fsync` is a compile error rather than a silent data loss bug. `RETURN_IF_ERROR` and
+`ASSIGN_OR_RETURN` keep the call sites readable.
+
+```cpp
+#include "dedupe/store.h"
+
+using namespace dedupe;
+
+auto opened = Store::open("/var/lib/backups");        // Result<std::unique_ptr<Store>>
+if (!opened.ok()) {
+  std::fprintf(stderr, "open: %s\n", opened.status().message().c_str());
+  return 1;
+}
+Store& store = **opened;
+
+auto in = store.ingest_file("nightly/report.pdf", "/data/report.pdf");
+if (!in.ok()) { /* in.status().code() is an Err enum */ }
+printf("%llu chunks, %llu new, %llu deduplicated\n",
+       in.value().chunks_total, in.value().chunks_new, in.value().chunks_deduped);
+
+RETURN_IF_ERROR(store.restore("nightly/report.pdf", "/tmp/report.pdf"));
+ASSIGN_OR_RETURN(std::vector<uint8_t> bytes,
+                 store.restore_bytes("nightly/report.pdf"));   // or straight to memory
+```
+
+Opening a store takes an exclusive `flock` for as long as the handle lives, recovers any
+interrupted compaction, and rebuilds the index by scanning the containers. The rest of the
+surface is `remove`, `exists`, `list`, `stats`, `read_recipe` and `verify`:
+
+```cpp
+ASSIGN_OR_RETURN(StoreStats s, store.stats());
+printf("%.2fx across %llu files\n", s.dedup_ratio(), s.files);
+
+ASSIGN_OR_RETURN(VerifyReport v, store.verify(VerifyLevel::kDeep));   // kQuick skips re-reading chunks
+for (const std::string& problem : v.problems) std::fputs(problem.c_str(), stderr);
+```
+
+Ingesting many files in one go is worth a session. The durability cost of publishing a
+file is one `fsync` per container it touched, and a session lets consecutive files share
+an open container instead of rolling a new one each time:
+
+```cpp
+ASSIGN_OR_RETURN(IngestSession session, store.begin_ingest());
+for (const auto& [name, path] : files) {
+  RETURN_IF_ERROR(session.ingest_file(name, path).status());
+}
+RETURN_IF_ERROR(session.finish());    // flush and close the session's container
+```
+
+Reclaiming space is a separate object, so the caller decides whether it runs inline or on
+its own thread:
+
+```cpp
+#include "dedupe/gc.h"
+
+Gc gc(&store);
+ASSIGN_OR_RETURN(GcStats g, gc.run_once());        // one deterministic cycle
+printf("swept %llu entries, deleted %llu containers\n", g.swept, g.containers_deleted);
+
+gc.start();                                        // or: a background thread, every 2s
+// ...
+gc.stop();
+```
+
+`Store` is safe to use from several threads at once: concurrent `ingest_file`, `restore`
+and `stats` are expected, and the concurrency suites exercise exactly that under TSan.
+Give each thread its own `IngestSession`, and run one collector per store.
+
+Store behaviour is set at open time through `StoreOptions`, which carries the chunker
+parameters (minimum, average and maximum chunk size, and the two masks) and
+`verify_fingerprint_on_read`, on by default. Chunker parameters are recorded in the
+store's superblock on creation and reloaded from it afterwards, because re-chunking an
+existing store with different parameters would silently stop it deduplicating against
+everything already there.
+
+## Architecture
+
+### Components
+
+| | |
+|---|---|
+| `chunker.h` | Gear rolling hash and the FastCDC cut-point rules. Pure and stateless, plus a streaming wrapper that cuts across buffer boundaries without copying the whole input |
+| `sha256.h`, `crc32c.h` | Fingerprints and record checksums. Each has a portable implementation and a hardware one selected at runtime, with the two tested against each other |
+| `index.h` | Fingerprint to location. 256 independently locked shards, each a flat Robin Hood table of 32-byte entries |
+| `format.h` | The on-disk structures: container header, chunk record header, recipe. Encode, decode, and the validation that decoding a hostile file requires |
+| `container.h` | Append-only chunk files. The writer buffers and tracks what is visible against what is durable; the reader verifies; the scanner recovers a torn tail |
+| `io.h` | Every syscall the engine makes, wrapped so it returns a `Status`, plus atomic file publication and the fault injection the crash tests drive |
+| `store.h` | The engine: open and recover, ingest, restore, verify, and the durability ordering that ties them together |
+| `gc.h`, `gc_journal.h` | Epoch mark and sweep, copy-forward compaction, and the intent log that makes compaction crash-safe |
+
+### What the store looks like on disk
+
+```
+<store>/
+  STORE              superblock: magic, version, store UUID, chunker parameters, CRC32C
+  LOCK               flock'd for as long as a process holds the store open
+  containers/
+    c00000001.dat    32-byte header, then chunk records appended forever
+    c00000002.dat
+  recipes/
+    <sha256(name)>.rcp
+  gc-journal         compaction intent log: BEGIN, COMMIT, DONE, DELETE
+```
+
+A chunk record is a 48-byte header followed by the payload:
+
+```
+offset  size  field
+     0     4  "CHNK", the magic that marks a record boundary
+     4     4  payload length
+     8     4  CRC32C of the payload
+    12     4  flags
+    16    32  SHA-256 fingerprint of the payload
+    48     n  payload
+```
+
+Carrying the full fingerprint and the length in every record is what makes a container
+self-describing, and therefore what makes the index disposable. A recipe is a 64-byte
+header (magic, version, logical size, chunk count, the whole file's SHA-256, the length of
+the original name, and a CRC32C covering all of it) followed by the name and then
+`chunk_count` entries of 36 bytes each: a 32-byte fingerprint and a 4-byte length.
+Recipes are named by the SHA-256 of the file name, so no user-controlled byte ever reaches
+the filesystem.
+
+### The ingest path
+
+1. The chunker scans the incoming bytes and returns a cut point.
+2. SHA-256 over that chunk gives its fingerprint.
+3. The index is probed. A hit returns a location and nothing is written.
+4. A miss appends a record to this session's container and inserts the location.
+5. The fingerprint is appended to the recipe, which is held in memory, and the whole-file
+   hash is updated. Steps 1 to 5 repeat to the end of the file.
+6. Every container the recipe references is fsynced, including containers other threads
+   wrote that this file deduplicated against.
+7. The recipe is written to a uniquely named temporary file, fsynced, renamed into place,
+   and the directory is fsynced.
+
+Step 6 before step 7 is the whole durability argument. A recipe is what makes a file
+exist, so it is published last, and a crash can then leave missing chunks or a missing
+file but never a file that lists and cannot be read.
+
+### The restore path
+
+1. Read the recipe and check its CRC32C.
+2. For each fingerprint in order, look up the location in the index.
+3. Read the record, verify the CRC32C, and verify that the header's full 32-byte
+   fingerprint is the one that was asked for.
+4. Append the payload to the output.
+5. Hash the reassembled file and compare against the whole-file digest in the recipe,
+   which catches the one failure per-chunk checks cannot: correct chunks in the wrong
+   order.
+
+### Threads
+
+Each ingest session owns a container, so appends never queue behind another thread. The
+index is sharded 256 ways by the first byte of the fingerprint, and lookups take a shared
+lock, so readers do not exclude each other. Recipes are built in thread-local memory and
+touch the filesystem exactly once, so they need no lock at all, and the atomicity of
+`rename` settles the case where two threads publish the same name.
+
+The collector never holds an index lock across I/O: it marks under a shared lock, sweeps
+in bounded batches that release the lock between them, and copies chunks during compaction
+with no lock held. Measured against an idle store, the foreground stays within 20% at p50,
+p90 and p99.
+
+## Design decisions
 
 **Chunk boundaries come from the data, not from the offset.** Cutting every 8 KiB would
 mean that inserting a single byte near the start of a file shifts every later boundary, so
@@ -65,30 +264,18 @@ each fingerprint to halve its memory, and every read verifies the full 32 bytes 
 chunk's own header, so a truncated-key collision would fail loudly instead of returning
 the wrong bytes.
 
-**Containers and recipes on disk are the only authoritative state.** Chunks are appended
-to container files as self-describing records: a 48-byte header carrying the length, a
-CRC32C, and the full fingerprint, followed by the payload. Because each record describes
-itself, the in-memory index is a cache that is rebuilt by scanning containers whenever the
-store opens. Losing it costs startup time, not data, which turns index durability from a
-correctness problem into a performance one.
+**Containers and recipes on disk are the only authoritative state.** Because each record
+describes itself, the in-memory index is a cache that is rebuilt by scanning containers
+whenever the store opens. Losing it costs startup time, not data, which turns index
+durability from a correctness problem into a performance one.
 
-**Durability is an ordering rule.** Never publish a reference before the data it points at
-is on the disk. Publishing a file therefore looks like this:
-
-```
-append chunks to containers
-fsync every container this recipe references   (including ones other threads wrote)
-write the recipe to a temporary file
-fsync it
-rename it into place                           (atomic: the file appears whole or not at all)
-fsync the directory                            (so the name itself is durable)
-```
-
-A crash can leave four states, and only one of them is unacceptable: a recipe on disk
-pointing at chunks that never reached it, which is a file that lists but cannot be read.
-The ordering above makes that state unreachable. Recovery truncates any torn tail at the
-first record that fails its checks, which is safe precisely because a published recipe can
-only reference bytes that were already fsynced.
+**Durability is an ordering rule:** never publish a reference before the data it points at
+is on the disk. It appears three times over, at different scales. Chunks are fsynced
+before the recipe that names them. A recipe's bytes are fsynced before the rename that
+publishes them, and the directory is fsynced after it. The collector's journal record
+reaches the disk before the compaction step it describes. Recovery truncates any torn tail
+at the first record that fails its checks, which is safe precisely because a published
+recipe can only reference bytes that were already fsynced.
 
 **Space is reclaimed by mark and sweep, not reference counts.** Counts race with in-flight
 deduplication hits, and they cannot heal: one lost decrement leaks a chunk forever and
@@ -98,10 +285,12 @@ still running. Containers that fall below half live are rewritten and the origin
 deleted, with the intent written to a journal first so an interrupted compaction is either
 finished or undone on the next open.
 
-**Threads are kept apart rather than serialized.** Each ingest writes to its own container,
-and the index is split into 256 independently locked shards chosen by the first byte of the
-fingerprint, with lookups taking a shared lock. The cost is restore locality, since one
-file's chunks end up spread across containers.
+**The index is a flat open-addressed table rather than a node-based map.** At 32 bytes per
+entry, two fit in a cache line and a lookup is usually one memory touch instead of a
+pointer chase. Robin Hood probing keeps displaced entries near their home slot, which
+allows the early exit that makes unsuccessful lookups cheap, and unsuccessful is the
+common case here because every new chunk misses. Deletion shifts the following run back
+rather than leaving tombstones, which would lengthen every probe until a rebuild.
 
 ## Measurements
 
@@ -151,7 +340,7 @@ Benchmarks and the crash sweep are slow and deliberately kept out of the gate:
 ./scripts/dev.sh ./build-none/crashtest 20    # kill -9 at the Nth syscall, exhaustively
 ```
 
-## Layout
+## Repository layout
 
 ```
 include/dedupe/   public headers: chunker, sha256, crc32c, index, container, format,

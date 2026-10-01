@@ -1,4 +1,4 @@
-// T9: the résumé's storage-reduction number (R1.4).
+// T9: the project's headline storage-reduction number (R1.4).
 //
 // A dedup ratio is a property of the DATA, not the engine. Ten full backups of a
 // slowly-changing tree dedup ~8x; ten tarballs of unrelated random bytes dedup

@@ -165,7 +165,7 @@ and lives in cache; at 1M it is 49 MiB and every probe is a main-memory access. 
 distance does not grow (12 → 19), which is what says the *algorithm* is fine.
 
 Deduplication throughput over that same 16× growth: **2021 → 1925 MB/s, a 4.8% decline.**
-That is the number résumé bullet R3.2 is about, and it holds because a chunk costs ~4.5 µs
+That is the number headline claim R3.2 is about, and it holds because a chunk costs ~4.5 µs
 to fingerprint and ~0.1 µs to look up — the index is under 2% of the work. Reporting the
 index latency alone would have overstated the problem; reporting only the throughput would
 have hidden it. Both are here.
@@ -394,12 +394,12 @@ each edit to the one or two chunks that contain it. That is the boundary-shift p
 from T2 showing up as an end-to-end economic result, and it is precisely what fixed-size
 chunking cannot do.
 
-### On the résumé's "about 4 times"
+### On the project's headline "about 4 times"
 
 The measured ratio for this workload at 8 generations is **7.36×**; **4× corresponds to
 roughly 4 generations** (3.88×). The bullet is therefore conservative rather than
 overstated — but "about 4 times" with no workload attached is not a checkable claim in
-either direction, which is the real problem with it. See `docs/RESUME.md`.
+either direction, which is the real problem with it. See `docs/CLAIMS.md`.
 
 Every run of this benchmark ends with `verify --deep` over the whole store, and prints
 `!! verify FAILED -- ratio above is meaningless` instead of a number if it does not pass.

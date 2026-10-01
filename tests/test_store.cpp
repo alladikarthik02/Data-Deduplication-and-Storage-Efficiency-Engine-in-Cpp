@@ -1,6 +1,6 @@
 // The store end to end (SPEC R1.3, R1.5, S1, S3, S4, S12, S14).
 //
-// This is where "restore correctness intact" from the résumé bullet stops being
+// This is where "restore correctness intact" from the headline claim stops being
 // a design intention and becomes a property that a randomized round-trip test
 // either holds or breaks.
 #include <fcntl.h>

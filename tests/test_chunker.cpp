@@ -1,7 +1,7 @@
 // Content-defined chunking (SPEC R1.1, 8.8).
 //
 // The headline test here is chunker_boundary_shift_property. Everything the
-// résumé bullet claims about "content-defined chunks" reduces to that one
+// headline claim claims about "content-defined chunks" reduces to that one
 // measurement, and it is run side-by-side against fixed-size chunking so the
 // difference is a number rather than an assertion of principle.
 #include <algorithm>

@@ -1,4 +1,4 @@
-// T4 measurement: the two claims in résumé bullet R3.
+// T4 measurement: the two claims in headline claim R3.
 //
 //   R3.1 "memory-efficient fingerprint index"  -> measured against the two
 //        implementations a reasonable engineer would otherwise have written,

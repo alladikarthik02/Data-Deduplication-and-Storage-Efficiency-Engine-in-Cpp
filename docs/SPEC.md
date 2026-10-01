@@ -1,7 +1,6 @@
 # `dedupe` — Technical Specification
 
 **Project:** Data Deduplication and Storage Efficiency Engine (C++)
-**Résumé:** `Karthik_Alladi_PureStorage_SWE_Grad_CPP_Storage_Systems.pdf`, Academic Project #1
 **Status:** living document — edited as reality contradicts it (contradictions get logged in `CHALLENGES.md`)
 
 ---
@@ -9,11 +8,11 @@
 ## 0. How to read this document
 
 - §1 says what this is and what it deliberately is not.
-- §2 is the **contract with the résumé**: every bullet mapped to a testable requirement. If a bullet
+- §2 is the **contract with the headline claims**: every bullet mapped to a testable requirement. If a bullet
   cannot be honestly satisfied by the finished code, the *bullet* changes — not the measurement.
 - §3 is the architecture.
 - §4 is the **essential function list** — the API/CLI surface that must exist for this to be the
-  project the résumé claims.
+  project the headline claims describe.
 - §5 is the **safety requirements** (S1–S14). This is the checklist to re-read at the end of every
   task: *"which of these did I just put at risk, and what proves I didn't break it?"*
 - §6 is the testing strategy, §7 the task breakdown (the build order with explicit stop points),
@@ -38,15 +37,15 @@
 
 | Not doing | Why |
 |---|---|
-| Compression of chunk payloads | The résumé's storage-reduction number must be attributable to **deduplication alone**. Adding zlib would inflate the ratio and make the claim unfalsifiable. (Compression belongs to résumé project #2, in-transit.) |
+| Compression of chunk payloads | The project's headline storage-reduction number must be attributable to **deduplication alone**. Adding zlib would inflate the ratio and make the claim unfalsifiable. (Compression belongs to project #2, in-transit.) |
 | A FUSE filesystem / POSIX file semantics | The bullet says *engine*, not filesystem. Mount semantics (partial writes, mmap, O_DIRECT) would triple the work and add nothing the bullet claims. |
-| Distributed / multi-node replication | That is résumé project #2. Keeping them separate keeps each defensible. |
-| An on-disk (tiered) fingerprint index | Documented as the honest scaling limit in §8.3 instead. Faking a Bloom-filter tier that never touches disk would be résumé décor. |
+| Distributed / multi-node replication | That is project #2. Keeping them separate keeps each defensible. |
+| An on-disk (tiered) fingerprint index | Documented as the honest scaling limit in §8.3 instead. Faking a Bloom-filter tier that never touches disk would be decoration. |
 | Encryption, auth, multi-tenancy | Not claimed anywhere. |
 
 ---
 
-## 2. Résumé bullets → testable requirements (the contract)
+## 2. Headline claims → testable requirements (the contract)
 
 > **R1.** "Built a C++ deduplication engine that splits incoming data into content-defined chunks,
 > fingerprints them, and stores only unique chunks, achieving about 4 times storage reduction on a
@@ -84,7 +83,7 @@
 | R3.4 | "Extensive automated test suite." | ✅ **103 tests in 13 suites × 3 configurations = 309 runs** per gate: unit, property, differential, fault-injection, crash-recovery, concurrency, corruption-fuzz. Plus a 225-point crash sweep. |
 
 **Integrity rule (carried over from previous projects):** if the finished engine cannot hit a number
-on the résumé, we change the résumé, not the measurement. Every claim in this project must be
+in a claim, we change the claim, not the measurement. Every claim in this project must be
 reproducible by a stranger running one command in the container.
 
 ---
@@ -350,7 +349,7 @@ chunk size of 9294 B that is **0.554% of logical data**, so 1 TiB of unique data
 
 ### 3.6 Background space reclamation
 
-The hard problem, and the reason this is bullet #2 on the résumé.
+The hard problem, and the reason this is headline claim #2.
 
 **Why not reference counting.** Refcounts race: a chunk's count can hit zero while another thread is
 mid-ingest and about to dedup-hit that exact chunk. The window between "count reached 0" and "chunk
@@ -419,7 +418,7 @@ shrinks the store the foreground is working in. Holds even at 316 GC cycles duri
 
 ## 4. Essential functions — the required surface
 
-If any of these is missing, this is not the project the résumé describes.
+If any of these is missing, this is not the project the headline claims describe.
 
 ### 4.1 Library API (`include/dedupe/`)
 
@@ -500,7 +499,7 @@ what test now covers it?"* Any "not covered" becomes an entry in `CHALLENGES.md`
 | **Concurrency** | Races and deadlocks under N-writer / M-reader / GC load. | `tests/test_concurrent.cpp`, `test_gc_stress.cpp` (also built under TSan) |
 | **Corruption fuzz** | Hostile/damaged store files. | `tests/test_corrupt.cpp` (under ASan) |
 | **Sanitizers** | UB, leaks, races. | `scripts/check.sh` builds three configurations: normal, ASan+UBSan, TSan — all suites run in each. |
-| **Benchmarks** | The résumé's numbers. | `bench/*`, results recorded in `docs/BENCHMARKS.md` with the exact command that produced them. |
+| **Benchmarks** | The project's headline numbers. | `bench/*`, results recorded in `docs/BENCHMARKS.md` with the exact command that produced them. |
 
 **Rule:** every task in §7 ends with `ctest` green, and no task is "done" while a suite is red.
 
@@ -521,8 +520,8 @@ Each task is a stop point: build green, tests green, then an explanation before 
 | **T6** | Concurrency | Multi-threaded ingest, per-thread containers, restore under load | TSan clean; throughput vs thread count recorded |
 | **T7** | Space reclamation | `gc.h/.cpp` — epoch mark-sweep + copy-forward compaction + journal | S2 stress test; space actually shrinks; foreground latency measured (R2.5) |
 | **T8** | Crash & fault injection | `tools/crashtest`, fault hooks wired through | ≥8 injection points survive open + `verify --deep` + restore-all |
-| **T9** | Benchmarks & the résumé numbers | `bench/*`, `docs/BENCHMARKS.md` | Dedup ratio on the defined corpus; scaling curve; index bytes/chunk; GC latency |
-| **T10** | Hardening & docs | `README.md`, `verify --deep`, S-table sweep, résumé bullet reconciliation | Every S1–S14 row has a named passing test; bullets rewritten if the numbers say so |
+| **T9** | Benchmarks & the headline numbers | `bench/*`, `docs/BENCHMARKS.md` | Dedup ratio on the defined corpus; scaling curve; index bytes/chunk; GC latency |
+| **T10** | Hardening & docs | `README.md`, `verify --deep`, S-table sweep, headline claim reconciliation | Every S1–S14 row has a named passing test; bullets rewritten if the numbers say so |
 
 ---
 
@@ -556,7 +555,7 @@ stream-informed layout — chunks of one write stream kept adjacent. Out of scop
 ~43 B per unique chunk means 1 TiB of unique data needs ~5.6 GiB of index. Production dedup systems
 (Data Domain and friends) attack this with on-disk index tiers, Bloom filters, sparse indexing and
 locality-preserving caches. We are **not** building that; §1 says so. What we *will* do is measure
-bytes/chunk honestly and state the ceiling. A résumé claim of "memory-efficient index" that means
+bytes/chunk honestly and state the ceiling. A claim of "memory-efficient index" that means
 "5× smaller than the naïve `unordered_map`, measured" is defensible; one that implies petabyte-scale
 tiering is not.
 

@@ -1,4 +1,4 @@
-// S2 under concurrent load -- the test résumé bullet #2 lives or dies on.
+// S2 under concurrent load -- the test headline claim #2 lives or dies on.
 //
 // "Background space reclamation ... running concurrently with reads and writes
 // without blocking foreground operations" is only a claim until GC is actually

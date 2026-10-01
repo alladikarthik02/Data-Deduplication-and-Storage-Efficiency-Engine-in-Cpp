@@ -1,4 +1,4 @@
-// Background space reclamation -- résumé bullet #2, and the hardest correctness
+// Background space reclamation -- headline claim #2, and the hardest correctness
 // problem in this engine.
 //
 // WHY NOT REFERENCE COUNTING.

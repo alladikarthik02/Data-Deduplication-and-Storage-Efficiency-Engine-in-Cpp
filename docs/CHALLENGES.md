@@ -17,9 +17,9 @@ was actually hard.
 
 ---
 
-## B1 🧱 Cannot read the résumé PDF: no `pdftotext`, no `pdftoppm`
+## B1 🧱 Cannot read the project brief: no `pdftotext`, no `pdftoppm`
 
-**Symptom.** The very first action of the project — read the résumé to find out what project #1
+**Symptom.** The very first action of the project — read the project brief to find out what project #1
 actually claims — failed twice:
 
 ```
@@ -43,7 +43,7 @@ Python library that happened to already be in the pyenv environment.
 **Fix.** Extract the text with `pypdf` directly instead of installing system packages:
 
 ```bash
-python3 -c "from pypdf import PdfReader; print(PdfReader('résumé.pdf').pages[0].extract_text())"
+python3 -c "from pypdf import PdfReader; print(PdfReader('brief.pdf').pages[0].extract_text())"
 ```
 
 Deliberately did **not** `brew install poppler` — installing a system package to read one file
@@ -531,7 +531,7 @@ unordered_map      92.7 B/entry
 ```
 
 A 32-byte entry at the design's 0.75 load factor should cost 42.7 B/entry. We were at
-72.9 — and only **1.27× better** than the baseline the résumé bullet claims to beat. The
+72.9 — and only **1.27× better** than the baseline the headline claim claims to beat. The
 spec's memory-efficiency claim was, at that moment, not true.
 
 **Hypotheses.**

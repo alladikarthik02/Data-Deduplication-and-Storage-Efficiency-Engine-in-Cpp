@@ -1,11 +1,11 @@
-# Résumé reconciliation
+# Claims reconciliation
 
-The project was built to make three résumé bullets true and checkable. This document
+The project was built to make three headline claims true and checkable. This document
 compares each claim against what the finished engine actually does, and proposes wording
 that a reader could verify.
 
 **The rule, set in `SPEC.md` §2 before any code was written:** if the finished engine
-cannot hit a number on the résumé, the *bullet* changes, not the measurement. That rule
+cannot hit a number in a claim, the *claim* changes, not the measurement. That rule
 cuts both ways, and here it cut the other way — one claim turned out to be conservative.
 
 Every number below is reproduced by one command in `BENCHMARKS.md`.
@@ -101,7 +101,7 @@ made the store refuse to open at all.
 
 ---
 
-## Claims the résumé does not make, and could
+## Claims not made, and could have been
 
 - **Crash safety.** 225 injection points across nine syscall classes, 52 real process
   kills, **zero failures**, where the assertion is that *presence implies correctness*: a

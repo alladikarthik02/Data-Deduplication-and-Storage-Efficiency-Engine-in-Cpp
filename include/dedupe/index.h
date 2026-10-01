@@ -1,6 +1,6 @@
 // The fingerprint index: fingerprint -> where that chunk lives.
 //
-// This is the structure résumé bullet R3.1 ("memory-efficient fingerprint index")
+// This is the structure headline claim R3.1 ("memory-efficient fingerprint index")
 // and R3.2 ("throughput steady as the dataset grew") are about, so every choice
 // below is made for one of those two reasons and is measured in bench_index.
 //
